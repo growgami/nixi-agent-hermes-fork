@@ -590,8 +590,14 @@ def _load_enabled_toolsets() -> list[str] | None:
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
+        # Runtime toolset resolution must include default MCP servers so the
+        # agent can actually call them. Passing ``False`` here is the
+        # config-editing variant — used when we need to persist a toolset
+        # list without baking in implicit MCP defaults. Using the wrong
+        # variant at agent creation time makes MCP tools silently missing
+        # from the TUI. See PR #3252 for the original design split.
         enabled = sorted(
-            _get_platform_tools(load_config(), "cli", include_default_mcp_servers=False)
+            _get_platform_tools(load_config(), "cli", include_default_mcp_servers=True)
         )
         return enabled or None
     except Exception:
@@ -3230,29 +3236,6 @@ def _(rid, params: dict) -> dict:
                 pass
         # Fallback: no active run, treat as next-turn message
         return _ok(rid, {"type": "send", "message": arg})
-
-    if name == "plan":
-        try:
-            from agent.skill_commands import (
-                build_skill_invocation_message as _bsim,
-                build_plan_path,
-            )
-
-            user_instruction = arg or ""
-            plan_path = build_plan_path(user_instruction)
-            msg = _bsim(
-                "/plan",
-                user_instruction,
-                task_id=session.get("session_key", "") if session else "",
-                runtime_note=(
-                    "Save the markdown plan with write_file to this exact relative path "
-                    f"inside the active workspace/backend cwd: {plan_path}"
-                ),
-            )
-            if msg:
-                return _ok(rid, {"type": "send", "message": msg})
-        except Exception as e:
-            return _err(rid, 5030, f"plan skill failed: {e}")
 
     return _err(rid, 4018, f"not a quick/plugin/skill command: {name}")
 
