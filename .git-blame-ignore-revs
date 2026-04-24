@@ -1,0 +1,5 @@
+# Revisions to ignore in git blame
+# Add SHAs of cosmetic upstream merges here (formatting renames, line-ending changes)
+# so they don't pollute git blame output.
+#
+# Usage: git blame --ignore-revs-file .git-blame-ignore-revs <file>
