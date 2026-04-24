@@ -2925,6 +2925,15 @@ class GatewayRunner:
                 return None
             return QQAdapter(config)
 
+        elif platform == Platform.NIXI:
+            from nixi.gateway_adapter import NixiAdapter, check_nixi_requirements
+            if not check_nixi_requirements():
+                logger.warning("Nixi: aiohttp not installed or NIXI_INTERNAL_SECRET not set")
+                return None
+            adapter = NixiAdapter(config)
+            adapter.gateway_runner = self  # For cross-platform delivery
+            return adapter
+
         return None
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -2943,7 +2952,12 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        # Nixi: Auth is at two levels — (1) bearer token at adapter level
+        # validates Sludge connection, (2) workspace membership enforced by
+        # Sludge routing. Per-employee auth is at the workspace level, so
+        # per-user allowlisting is not needed here. Use NIXI_ALLOWED_USERS
+        # for future per-employee restriction.
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NIXI):
             return True
 
         user_id = source.user_id
@@ -2967,6 +2981,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.NIXI: "NIXI_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",

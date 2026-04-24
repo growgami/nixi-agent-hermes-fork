@@ -422,6 +422,10 @@ PLATFORM_HINTS = {
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
     ),
+    "nixi": (
+        "You are responding via the Nixi multi-tenant gateway. Your responses go to Slack. "
+        "Use Slack-compatible formatting. You represent the company, not just one user."
+    ),
 }
 
 # ---------------------------------------------------------------------------
