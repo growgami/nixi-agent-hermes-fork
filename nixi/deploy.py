@@ -9,6 +9,7 @@ Environment variables:
   NIXI_PORT            — HTTP listen port (default 8080)
   SLACK_BOT_TOKEN      — workspace-specific xoxb- token
   NIXI_ALLOWED_USERS   — comma-separated Slack user IDs (empty = all allowed)
+  NIXI_HOME_CHANNEL    — Slack channel ID for home channel (silences startup warning)
   HERMES_HOME          — /data/tenants/{company_id} (path-jail)
   NIXI_MODE            — set to '1' automatically by start_nixi()
 """
@@ -92,6 +93,7 @@ def seed_if_needed(home: Path) -> None:
     model_provider = os.environ.get("HERMES_MODEL_PROVIDER", "openai")
     model = os.environ.get("HERMES_MODEL", "gpt-4o")
     slack_workspace_id = os.environ.get("NIXI_TEAM_ID", "")
+    home_channel = os.environ.get("NIXI_HOME_CHANNEL", "")
 
     seed_hermes_home(
         home=home,
@@ -99,6 +101,7 @@ def seed_if_needed(home: Path) -> None:
         slack_workspace_id=slack_workspace_id,
         model_provider=model_provider,
         model=model,
+        home_channel=home_channel,
     )
 
     logger.info("[nixi] Seeded config at %s", config_path)
@@ -161,6 +164,8 @@ def start_nixi() -> None:
     print(f"  Home:       {home}")
     print(f"  Port:       {port}")
     print(f"  Model:      {model_provider}/{model}")
+    home_channel = os.environ.get("NIXI_HOME_CHANNEL", "")
+    print(f"  Home Channel: {home_channel if home_channel else '(not set)'}")
     print(f"  Mode:       nixi (Slack send-only)")
     print()
 

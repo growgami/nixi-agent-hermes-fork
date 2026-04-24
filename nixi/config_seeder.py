@@ -65,6 +65,7 @@ def seed_hermes_home(
     slack_workspace_id: str,
     model_provider: str,
     model: str,
+    home_channel: str = "",
     soul_content: str | None = None,
     agents_content: str | None = None,
 ) -> None:
@@ -79,6 +80,9 @@ def seed_hermes_home(
         slack_workspace_id: Slack workspace/team ID.
         model_provider: LLM provider name.
         model: LLM model slug.
+        home_channel: Slack channel ID for the nixi home channel. When non-empty,
+            included as gateway.nixi.home_channel in config.yaml. When empty/omitted,
+            the key is left out entirely.
         soul_content: Custom SOUL.md content (falls back to default template).
         agents_content: Custom AGENTS.md content (falls back to default template).
     """
@@ -87,6 +91,7 @@ def seed_hermes_home(
         slack_workspace_id=slack_workspace_id,
         model_provider=model_provider,
         model=model,
+        home_channel=home_channel,
     )
 
     # Create directory structure

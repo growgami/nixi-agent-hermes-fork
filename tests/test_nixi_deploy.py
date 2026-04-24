@@ -375,4 +375,95 @@ class TestStartNixi:
                 start_nixi()
 
 
+class TestSeedIfNeededHomeChannel:
+    """Tests for NIXI_HOME_CHANNEL pass-through in seed_if_needed."""
+
+    def test_home_channel_passed_to_seed(self, tmp_path):
+        """seed_if_needed reads NIXI_HOME_CHANNEL and passes it to seed_hermes_home."""
+        from nixi.deploy import seed_if_needed
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        with patch.dict(os.environ, {
+            "NIXI_HOME_CHANNEL": "C0AE0QVNT1P",
+        }):
+            seed_if_needed(home)
+
+        config_path = home / "config.yaml"
+        assert config_path.exists()
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        assert config["gateway"]["nixi"]["home_channel"] == "C0AE0QVNT1P"
+
+    def test_home_channel_omitted_when_env_unset(self, tmp_path):
+        """seed_if_needed omits home_channel when NIXI_HOME_CHANNEL is not set."""
+        from nixi.deploy import seed_if_needed
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("NIXI_HOME_CHANNEL", None)
+            seed_if_needed(home)
+
+        config_path = home / "config.yaml"
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        assert "home_channel" not in config["gateway"]["nixi"]
+
+
+class TestStartNixiHomeChannel:
+    """Tests for NIXI_HOME_CHANNEL in start_nixi startup banner and seeding."""
+
+    def test_banner_shows_home_channel_when_set(self, tmp_path, capsys):
+        """start_nixi banner shows the home channel ID when NIXI_HOME_CHANNEL is set."""
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+            "NIXI_HOME_CHANNEL": "C0AE0QVNT1P",
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("asyncio.run", return_value=True):
+                    start_nixi()
+
+        captured = capsys.readouterr()
+        assert "C0AE0QVNT1P" in captured.out
+
+    def test_banner_shows_not_set_when_empty(self, tmp_path, capsys):
+        """start_nixi banner shows '(not set)' when NIXI_HOME_CHANNEL is empty."""
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            os.environ.pop("NIXI_HOME_CHANNEL", None)
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("asyncio.run", return_value=True):
+                    start_nixi()
+
+        captured = capsys.readouterr()
+        assert "not set" in captured.out
+
+
 import logging

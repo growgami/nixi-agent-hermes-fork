@@ -14,6 +14,7 @@ def generate_seed_config(
     slack_workspace_id: str,
     model_provider: str,
     model: str,
+    home_channel: str = "",
 ) -> dict:
     """Build the config.yaml dict for a nixi tenant.
 
@@ -22,6 +23,9 @@ def generate_seed_config(
         slack_workspace_id: Slack workspace/team ID (e.g. T01XYZ567AB).
         model_provider: LLM provider name (e.g. "openai").
         model: LLM model slug (e.g. "gpt-4o").
+        home_channel: Slack channel ID for the nixi home channel (e.g. C0AE0QVNT1P).
+            When non-empty, included as gateway.nixi.home_channel. When empty/omitted,
+            the key is left out entirely (backward compatible).
 
     Returns:
         A dict ready to be written as config.yaml via atomic_yaml_write.
@@ -29,6 +33,10 @@ def generate_seed_config(
     # Dynamic _config_version — must match what check_config_version() compares
     # against, otherwise the migration wizard fires on every startup.
     config_version = DEFAULT_CONFIG.get("_config_version", 1)
+
+    nixi_section: dict = {"enabled": True}
+    if home_channel:
+        nixi_section["home_channel"] = home_channel
 
     return {
         "_config_version": config_version,
@@ -38,9 +46,7 @@ def generate_seed_config(
                 "enabled": True,
                 "workspace_id": slack_workspace_id,
             },
-            "nixi": {
-                "enabled": True,
-            },
+            "nixi": nixi_section,
         },
         "memory": {
             "scope": "organization",

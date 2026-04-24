@@ -32,6 +32,7 @@ export NIXI_INTERNAL_SECRET="<shared-secret-between-sludge-and-nixi>"
 export NIXI_TEAM_ID="T01XYZ567AB"
 export SLACK_BOT_TOKEN="xoxb-xxxx-xxxx"
 export HERMES_HOME="/data/tenants/acme"
+export NIXI_HOME_CHANNEL="C0AE0QVNT1P"   # Optional: silences "No home channel" warning
 
 # 2. Create the tenant home directory
 mkdir -p "$HERMES_HOME"
@@ -77,6 +78,7 @@ X-Nixi-User-Name: jane.doe
 | `NIXI_COMPANY_NAME` | Display name written to seeded `SOUL.md`. | `Tenant` | `Acme Corp` |
 | `HERMES_MODEL_PROVIDER` | LLM provider for seeded config. | `openai` | `anthropic` |
 | `HERMES_MODEL` | LLM model slug for seeded config. | `gpt-4o` | `claude-sonnet-4-20250514` |
+| `NIXI_HOME_CHANNEL` | Slack channel ID for the nixi home channel (silences startup warning). | `(not set)` | `C0AE0QVNT1P` |
 
 > **Note:** `SLACK_APP_TOKEN` is **not required** for nixi deployments. `NIXI_MODE=1` disables Socket Mode entirely — the Slack adapter operates in send-only mode using `SLACK_BOT_TOKEN` alone.
 
@@ -117,6 +119,7 @@ gateway:
     workspace_id: T01XYZ567AB
   nixi:
     enabled: true
+    home_channel: C0AE0QVNT1P   # Set from NIXI_HOME_CHANNEL; omitted when empty
 memory:
   scope: organization
 terminal:

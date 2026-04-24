@@ -258,6 +258,47 @@ class TestGenerateSeedConfig:
 
         assert config["memory"]["scope"] == "organization"
 
+    def test_home_channel_included_when_set(self):
+        """When home_channel is provided, it appears in gateway.nixi."""
+        from nixi.seed_config import generate_seed_config
+
+        config = generate_seed_config(
+            company_name="TestCorp",
+            slack_workspace_id="T12345",
+            model_provider="openai",
+            model="gpt-4o",
+            home_channel="C0AE0QVNT1P",
+        )
+
+        assert config["gateway"]["nixi"]["home_channel"] == "C0AE0QVNT1P"
+
+    def test_home_channel_omitted_when_empty(self):
+        """When home_channel is empty string, the key must NOT be in gateway.nixi."""
+        from nixi.seed_config import generate_seed_config
+
+        config = generate_seed_config(
+            company_name="TestCorp",
+            slack_workspace_id="T12345",
+            model_provider="openai",
+            model="gpt-4o",
+            home_channel="",
+        )
+
+        assert "home_channel" not in config["gateway"]["nixi"]
+
+    def test_home_channel_omitted_by_default(self):
+        """When home_channel is not passed, the key must NOT be in gateway.nixi."""
+        from nixi.seed_config import generate_seed_config
+
+        config = generate_seed_config(
+            company_name="TestCorp",
+            slack_workspace_id="T12345",
+            model_provider="openai",
+            model="gpt-4o",
+        )
+
+        assert "home_channel" not in config["gateway"]["nixi"]
+
 
 # ─── config_seeder tests ────────────────────────────────────────────────
 
@@ -369,3 +410,62 @@ class TestSeedHermesHome:
             config = yaml.safe_load(f)
 
         assert config["_config_version"] == DEFAULT_CONFIG.get("_config_version", 1)
+
+    def test_home_channel_in_config_when_set(self, tmp_path):
+        """seed_hermes_home with home_channel writes it to config.yaml."""
+        from nixi.config_seeder import seed_hermes_home
+
+        home = tmp_path / "tenants" / "testcorp"
+        seed_hermes_home(
+            home=home,
+            company_name="TestCorp",
+            slack_workspace_id="T12345",
+            model_provider="openai",
+            model="gpt-4o",
+            home_channel="C0AE0QVNT1P",
+        )
+
+        config_path = home / "config.yaml"
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        assert config["gateway"]["nixi"]["home_channel"] == "C0AE0QVNT1P"
+
+    def test_home_channel_omitted_from_config_when_empty(self, tmp_path):
+        """seed_hermes_home with empty home_channel omits the key from config.yaml."""
+        from nixi.config_seeder import seed_hermes_home
+
+        home = tmp_path / "tenants" / "testcorp"
+        seed_hermes_home(
+            home=home,
+            company_name="TestCorp",
+            slack_workspace_id="T12345",
+            model_provider="openai",
+            model="gpt-4o",
+            home_channel="",
+        )
+
+        config_path = home / "config.yaml"
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        assert "home_channel" not in config["gateway"]["nixi"]
+
+    def test_home_channel_omitted_from_config_by_default(self, tmp_path):
+        """seed_hermes_home without home_channel omits the key from config.yaml."""
+        from nixi.config_seeder import seed_hermes_home
+
+        home = tmp_path / "tenants" / "testcorp"
+        seed_hermes_home(
+            home=home,
+            company_name="TestCorp",
+            slack_workspace_id="T12345",
+            model_provider="openai",
+            model="gpt-4o",
+        )
+
+        config_path = home / "config.yaml"
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        assert "home_channel" not in config["gateway"]["nixi"]
