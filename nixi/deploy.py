@@ -19,9 +19,19 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 logger = logging.getLogger(__name__)
 
-# ── Required env vars for nixi deployment ──────────────────────────────────
+# ── Load .env before any env var reads ─────────────────────────────────────
+_env_paths = [
+    Path(__file__).resolve().parents[1] / ".env",  # repo root .env
+]
+for _p in _env_paths:
+    if _p.exists():
+        load_dotenv(_p, override=False)
+
+# ── Required env vars for nixi deployment ─────────────────────────────────
 _REQUIRED_VARS = [
     "NIXI_INTERNAL_SECRET",
     "NIXI_TEAM_ID",
@@ -57,9 +67,8 @@ def validate_env() -> Path:
 
     home = Path(raw_home).resolve()
     if not home.is_dir():
-        raise EnvironmentError(
-            f"HERMES_HOME does not exist or is not a directory: {home}"
-        )
+        home.mkdir(parents=True, exist_ok=True)
+        logger.info("[nixi] Created HERMES_HOME directory: %s", home)
 
     return home
 
@@ -133,13 +142,38 @@ def start_nixi() -> None:
             doesn't exist.
         SystemExit: With code 1 if the gateway fails to start.
     """
+    print()
+    print("  ╔══════════════════════════════════════╗")
+    print("  ║          nixi-agent v1.0.0            ║")
+    print("  ╚══════════════════════════════════════╝")
+    print()
+
     # Step 1: Validate environment
     home = validate_env()
     team_id = os.environ["NIXI_TEAM_ID"]
     port = _get_port()
+    model_provider = os.environ.get("HERMES_MODEL_PROVIDER", "openai")
+    model = os.environ.get("HERMES_MODEL", "gpt-4o")
+    company = os.environ.get("NIXI_COMPANY_NAME", "Tenant")
+
+    print(f"  Team:       {team_id}")
+    print(f"  Company:    {company}")
+    print(f"  Home:       {home}")
+    print(f"  Port:       {port}")
+    print(f"  Model:      {model_provider}/{model}")
+    print(f"  Mode:       nixi (Slack send-only)")
+    print()
 
     # Step 2: Seed config if needed
+    config_path = home / "config.yaml"
     seed_if_needed(home)
+
+    if config_path.exists():
+        print(f"  Config:     {config_path} (existing)")
+    else:
+        print(f"  Config:     {config_path} (seeded)")
+
+    print()
 
     # Step 3: Set NIXI_MODE BEFORE importing gateway
     # This must happen before gateway modules read the env var
@@ -153,11 +187,17 @@ def start_nixi() -> None:
     )
 
     # Step 4: Lazy import and start gateway
+    print("  Starting gateway...")
+    print()
     start_gateway = _import_gateway()
 
     success = asyncio.run(start_gateway())
     if not success:
         logger.error("[nixi] Gateway exited with failure")
+        print()
+        print("  [FAIL] Gateway exited with failure")
         sys.exit(1)
 
     logger.info("[nixi] Gateway shut down cleanly")
+    print()
+    print("  Gateway shut down cleanly")
