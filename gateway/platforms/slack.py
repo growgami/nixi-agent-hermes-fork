@@ -83,6 +83,7 @@ class SlackAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
         self._app: Optional[AsyncApp] = None
+        self._primary_client: Optional[AsyncWebClient] = None  # NIXI_MODE send-only
         self._handler: Optional[AsyncSocketModeHandler] = None
         self._bot_user_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
@@ -127,6 +128,10 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] slack-bolt not installed. Run: pip install slack-bolt",
             )
             return False
+
+        # ── Nixi send-only mode: skip Socket Mode, just init WebClients ──
+        if os.getenv("NIXI_MODE"):
+            return await self._connect_nixi_mode()
 
         raw_token = self.config.token
         app_token = os.getenv("SLACK_APP_TOKEN")
@@ -240,8 +245,75 @@ class SlackAdapter(BasePlatformAdapter):
             if lock_acquired and not self._running:
                 self._release_platform_lock()
 
+    async def _connect_nixi_mode(self) -> bool:
+        """Connect in send-only mode (Socket Mode disabled, Sludge handles inbound)."""
+        raw_token = self.config.token
+        if not raw_token:
+            logger.error("[Slack] SLACK_BOT_TOKEN not set (required for Nixi mode)")
+            return False
+
+        lock_acquired = False
+        try:
+            if not self._acquire_platform_lock('slack-bot-token', raw_token.split(',')[0].strip(), 'Slack bot token'):
+                return False
+            lock_acquired = True
+
+            bot_tokens = [t.strip() for t in raw_token.split(",") if t.strip()]
+            primary_token = bot_tokens[0]
+            self._primary_client = AsyncWebClient(token=primary_token)
+
+            # Auth with primary client
+            auth_response = await self._primary_client.auth_test()
+            self._bot_user_id = auth_response.get("user_id", "")
+            team_id = auth_response.get("team_id", "")
+            team_name = auth_response.get("team", "unknown")
+            bot_name = auth_response.get("user", "unknown")
+
+            self._team_clients[team_id] = self._primary_client
+            self._team_bot_user_ids[team_id] = self._bot_user_id
+            logger.info(
+                "[Slack] Authenticated as @%s in workspace %s (team: %s) [Nixi mode]",
+                bot_name, team_name, team_id,
+            )
+
+            # Register additional workspace tokens (multi-workspace)
+            for token in bot_tokens[1:]:
+                try:
+                    client = AsyncWebClient(token=token)
+                    resp = await client.auth_test()
+                    tid = resp.get("team_id", "")
+                    uid = resp.get("user_id", "")
+                    self._team_clients[tid] = client
+                    self._team_bot_user_ids[tid] = uid
+                    logger.info(
+                        "[Slack] Authenticated as @%s in workspace %s (team: %s) [Nixi mode]",
+                        resp.get("user", "unknown"), resp.get("team", "unknown"), tid,
+                    )
+                except Exception as e:
+                    logger.warning("[Slack] Additional token auth failed in Nixi mode: %s", e)
+
+            self._running = True
+            self._mark_connected()
+            logger.info("[Slack] Running in Nixi send-only mode (Socket Mode disabled)")
+            return True
+
+        except Exception as e:
+            logger.error("[Slack] Nixi mode connection failed: %s", e, exc_info=True)
+            return False
+        finally:
+            if lock_acquired and not self._running:
+                self._release_platform_lock()
+
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
+        # NIXI_MODE: skip Socket Mode/AsyncApp cleanup
+        if self._primary_client is not None:
+            self._primary_client = None
+            self._running = False
+            self._release_platform_lock()
+            logger.info("[Slack] Disconnected (Nixi mode)")
+            return
+
         if self._handler:
             try:
                 await self._handler.close_async()
@@ -258,7 +330,7 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = self._channel_team.get(chat_id)
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
-        return self._app.client  # fallback to primary
+        return self._primary_client or self._app.client  # NIXI_MODE fallback
 
     async def send(
         self,
@@ -268,7 +340,7 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a message to a Slack channel or DM."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
 
         try:
@@ -331,7 +403,7 @@ class SlackAdapter(BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent Slack message."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
@@ -358,7 +430,7 @@ class SlackAdapter(BasePlatformAdapter):
         Requires the assistant:write or chat:write scope.
         Auto-clears when the bot sends a reply to the thread.
         """
-        if not self._app:
+        if not self._app and not self._primary_client:
             return
 
         thread_ts = None
@@ -382,7 +454,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def stop_typing(self, chat_id: str) -> None:
         """Clear the assistant thread status indicator."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return
         thread_ts = self._active_status_threads.pop(chat_id, None)
         if not thread_ts:
@@ -447,7 +519,7 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload a local file to Slack."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
 
         if not os.path.exists(file_path):
@@ -580,7 +652,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, channel: str, timestamp: str, emoji: str
     ) -> bool:
         """Add an emoji reaction to a message. Returns True on success."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return False
         try:
             await self._get_client(channel).reactions_add(
@@ -596,7 +668,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, channel: str, timestamp: str, emoji: str
     ) -> bool:
         """Remove an emoji reaction from a message. Returns True on success."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return False
         try:
             await self._get_client(channel).reactions_remove(
@@ -648,11 +720,11 @@ class SlackAdapter(BasePlatformAdapter):
         if user_id in self._user_name_cache:
             return self._user_name_cache[user_id]
 
-        if not self._app:
+        if not self._app and not self._primary_client:
             return user_id
 
         try:
-            client = self._get_client(chat_id) if chat_id else self._app.client
+            client = self._get_client(chat_id) if chat_id else (self._primary_client or self._app.client)
             result = await client.users_info(user=user_id)
             user = result.get("user", {})
             # Prefer display_name → real_name → user_id
@@ -706,7 +778,7 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image to Slack by uploading the URL as a file."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
 
         from tools.url_safety import is_safe_url
@@ -786,7 +858,7 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a video file to Slack."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
 
         if not os.path.exists(video_path):
@@ -825,7 +897,7 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a document/file attachment to Slack."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
 
         if not os.path.exists(file_path):
@@ -858,7 +930,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""
-        if not self._app:
+        if not self._app and not self._primary_client:
             return {"name": chat_id, "type": "unknown"}
 
         try:
@@ -1286,7 +1358,7 @@ class SlackAdapter(BasePlatformAdapter):
         The buttons call ``resolve_gateway_approval()`` to unblock the waiting
         agent thread — same mechanism as the text ``/approve`` flow.
         """
-        if not self._app:
+        if not self._app and not self._primary_client:
             return SendResult(success=False, error="Not connected")
 
         try:

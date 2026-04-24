@@ -1921,3 +1921,170 @@ class TestProgressMessageThread:
             "so each @mention starts its own thread"
         )
         assert msg_event.message_id == "2000000000.000001"
+
+
+# ---------------------------------------------------------------------------
+# TestNixiSendOnlyMode
+# ---------------------------------------------------------------------------
+
+class TestNixiSendOnlyMode:
+    """Verify NIXI_MODE send-only behaviour: Socket Mode disabled, send() works."""
+
+    @pytest.mark.asyncio
+    async def test_connect_nixi_mode_skips_socket_mode(self):
+        """In NIXI_MODE, connect() should init _primary_client, skip AsyncApp/Socket Mode."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+        adapter = SlackAdapter(config)
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "team_id": "T_NIXI",
+            "user_id": "U_BOT",
+            "user": "nixibot",
+            "team": "NixiTeam",
+        })
+
+        with patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.dict(os.environ, {"NIXI_MODE": "1", "SLACK_BOT_TOKEN": "xoxb-fake-token"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)):
+            result = await adapter.connect()
+
+        assert result is True
+        assert adapter._primary_client is not None
+        assert adapter._app is None  # AsyncApp should NOT be created in NIXI_MODE
+        assert adapter._handler is None
+        assert "T_NIXI" in adapter._team_clients
+        assert adapter._bot_user_id == "U_BOT"
+
+    @pytest.mark.asyncio
+    async def test_connect_nixi_mode_multi_workspace(self):
+        """In NIXI_MODE with comma-separated tokens, all workspaces should be registered."""
+        config = PlatformConfig(enabled=True, token="xoxb-token1,xoxb-token2")
+        adapter = SlackAdapter(config)
+
+        call_count = 0
+        auth_responses = [
+            {"team_id": "T_TEAM1", "user_id": "U_BOT1", "user": "bot1", "team": "Team1"},
+            {"team_id": "T_TEAM2", "user_id": "U_BOT2", "user": "bot2", "team": "Team2"},
+        ]
+
+        def make_client(token):
+            nonlocal call_count
+            mock_client = AsyncMock()
+            mock_client.auth_test = AsyncMock(return_value=auth_responses[call_count])
+            call_count += 1
+            return mock_client
+
+        with patch.object(_slack_mod, "AsyncWebClient", side_effect=make_client), \
+             patch.dict(os.environ, {"NIXI_MODE": "1"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)):
+            result = await adapter.connect()
+
+        assert result is True
+        assert "T_TEAM1" in adapter._team_clients
+        assert "T_TEAM2" in adapter._team_clients
+        assert adapter._bot_user_id == "U_BOT1"  # first token is primary
+
+    @pytest.mark.asyncio
+    async def test_get_client_fallback_to_primary_in_nixi_mode(self):
+        """_get_client() should return _primary_client as fallback when _app is None."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_primary = AsyncMock()
+        adapter._primary_client = mock_primary
+        adapter._app = None
+
+        # unknown chat_id → no team mapping → should fall back to _primary_client
+        client = adapter._get_client("C_UNKNOWN")
+        assert client is mock_primary
+
+    def test_get_client_fallback_to_app_client_in_normal_mode(self):
+        """_get_client() should fall back to _app.client in normal mode."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_app_client = AsyncMock()
+        adapter._app = MagicMock()
+        adapter._app.client = mock_app_client
+        adapter._primary_client = None
+
+        client = adapter._get_client("C_UNKNOWN")
+        assert client is mock_app_client
+
+    @pytest.mark.asyncio
+    async def test_send_works_in_nixi_mode(self):
+        """send() should work when _app is None but _primary_client exists."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_client = AsyncMock()
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "1234.5"})
+        adapter._primary_client = mock_client
+        adapter._app = None
+        adapter._running = True
+
+        result = await adapter.send(chat_id="C_TEST", content="Hello from Nixi")
+        assert result.success
+
+    @pytest.mark.asyncio
+    async def test_send_blocked_when_no_app_and_no_primary(self):
+        """send() should fail when both _app and _primary_client are None."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        adapter._app = None
+        adapter._primary_client = None
+
+        result = await adapter.send(chat_id="C_TEST", content="Hello")
+        assert not result.success
+        assert "Not connected" in result.error
+
+    @pytest.mark.asyncio
+    async def test_disconnect_nixi_mode_skips_handler_cleanup(self):
+        """disconnect() in NIXI_MODE should skip socket handler cleanup, release lock."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        adapter._primary_client = AsyncMock()
+        adapter._app = None
+        adapter._handler = None
+        adapter._running = True
+        # Set lock identity so _release_platform_lock actually calls release_scoped_lock
+        adapter._platform_lock_scope = "slack-bot-token"
+        adapter._platform_lock_identity = "xoxb-fake"
+
+        with patch("gateway.status.release_scoped_lock") as mock_release:
+            await adapter.disconnect()
+
+        assert adapter._primary_client is None
+        mock_release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_normal_mode_unchanged(self):
+        """Without NIXI_MODE, connect() should use normal AsyncApp/Socket Mode path."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_app = MagicMock()
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "team_id": "T_NORMAL",
+            "user_id": "U_BOT",
+            "user": "normalbot",
+            "team": "NormalTeam",
+        })
+        mock_handler = MagicMock()
+        mock_handler.start_async = AsyncMock()
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=mock_handler), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)):
+            # Ensure NIXI_MODE is NOT set
+            os.environ.pop("NIXI_MODE", None)
+            result = await adapter.connect()
+
+        assert adapter._primary_client is None  # Should stay None in normal mode
+        assert adapter._app is not None
