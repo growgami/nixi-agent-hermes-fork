@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    NIXI = "nixi"
 
 
 @dataclass
@@ -1270,6 +1271,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=qq_home,
                 name=os.getenv("QQBOT_HOME_CHANNEL_NAME") or os.getenv(qq_home_name_env, "Home"),
             )
+
+    # Nixi (multi-tenant gateway adapter)
+    nixi_secret = os.getenv("NIXI_INTERNAL_SECRET")
+    if nixi_secret:
+        if Platform.NIXI not in config.platforms:
+            config.platforms[Platform.NIXI] = PlatformConfig()
+        config.platforms[Platform.NIXI].enabled = True
+        config.platforms[Platform.NIXI].token = nixi_secret
+        config.platforms[Platform.NIXI].extra.update({
+            "team_id": os.getenv("NIXI_TEAM_ID", ""),
+        })
+        nixi_port_str = os.getenv("NIXI_PORT", "")
+        try:
+            config.platforms[Platform.NIXI].extra["port"] = int(nixi_port_str) if nixi_port_str else 8080
+        except ValueError:
+            config.platforms[Platform.NIXI].extra["port"] = 8080
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

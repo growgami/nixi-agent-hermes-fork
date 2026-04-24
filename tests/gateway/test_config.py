@@ -452,3 +452,110 @@ class TestHomeChannelEnvOverrides:
             home = config.platforms[platform].home_channel
             assert home is not None, f"{platform.value}: home_channel should not be None"
             assert (home.chat_id, home.name) == expected, platform.value
+
+
+class TestNixiPlatformEnum:
+    """Verify NIXI enum member exists and resolves correctly."""
+
+    def test_nixi_enum_member_exists(self):
+        assert hasattr(Platform, "NIXI")
+        assert Platform.NIXI.value == "nixi"
+
+    def test_nixi_enum_from_string(self):
+        assert Platform("nixi") is Platform.NIXI
+
+
+class TestNixiEnvOverrides:
+    """Verify NIXI env var overrides create a PlatformConfig correctly."""
+
+    def test_nixi_env_override_creates_platform_config(self):
+        """When NIXI_INTERNAL_SECRET is set, NIXI platform should be enabled
+        with the secret as token and team_id/port in extra."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_TEAM_ID": "T01XYZ567AB",
+                "NIXI_PORT": "8080",
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        assert Platform.NIXI in config.platforms
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.enabled is True
+        assert nixi.token == "secret-abc123"
+        assert nixi.extra.get("team_id") == "T01XYZ567AB"
+        assert nixi.extra.get("port") == 8080
+
+    def test_nixi_env_override_without_secret_no_platform(self):
+        """Without NIXI_INTERNAL_SECRET, NIXI platform should not be added."""
+        config = GatewayConfig()
+        with patch.dict(os.environ, {}, clear=False):
+            # Ensure env vars are not set
+            with patch.dict(os.environ, {}, clear=True):
+                _apply_env_overrides(config)
+
+        assert Platform.NIXI not in config.platforms
+
+    def test_nixi_env_override_default_port(self):
+        """When NIXI_PORT is not set, port should default to 8080 in config."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_TEAM_ID": "T01XYZ567AB",
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.extra.get("port") == 8080
+
+    def test_nixi_env_override_invalid_port_uses_default(self):
+        """When NIXI_PORT is not a valid integer, it should default to 8080."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_TEAM_ID": "T01XYZ567AB",
+                "NIXI_PORT": "not-a-number",
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.extra.get("port") == 8080
+
+    def test_nixi_env_override_merges_with_existing_config(self):
+        """If config.yaml already has partial NIXI config, env overrides
+        should merge (enabled, token, extra keys) rather than replace."""
+        config = GatewayConfig(
+            platforms={
+                Platform.NIXI: PlatformConfig(
+                    enabled=False,
+                    extra={"custom_key": "preserved"},
+                ),
+            },
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_TEAM_ID": "T01TEAMID",
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.enabled is True
+        assert nixi.token == "secret-abc123"
+        assert nixi.extra.get("team_id") == "T01TEAMID"
+        assert nixi.extra.get("custom_key") == "preserved"
