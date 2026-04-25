@@ -18,6 +18,8 @@ import hmac
 import json
 import logging
 import os
+import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 try:
@@ -85,6 +87,25 @@ class NixiAdapter(BasePlatformAdapter):
         self._concurrency_semaphore: asyncio.Semaphore = asyncio.Semaphore(
             self._concurrency_limit
         )
+
+        # Overlay cache: avoids repeated disk reads for USER.md overlays.
+        # OrderedDict preserves insertion order for LRU eviction.
+        # Maps user_id → (overlay_text, timestamp).
+        self._overlay_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        _ttl_raw = extra.get("NIXI_OVERLAY_CACHE_TTL")
+        if _ttl_raw is None:
+            _ttl_raw = os.getenv("NIXI_OVERLAY_CACHE_TTL", "300")
+        try:
+            self._overlay_cache_ttl: int = int(_ttl_raw)
+        except (ValueError, TypeError):
+            self._overlay_cache_ttl = 300
+        _max_raw = extra.get("NIXI_OVERLAY_CACHE_MAX")
+        if _max_raw is None:
+            _max_raw = os.getenv("NIXI_OVERLAY_CACHE_MAX", "256")
+        try:
+            self._overlay_cache_max: int = int(_max_raw)
+        except (ValueError, TypeError):
+            self._overlay_cache_max = 256
 
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -242,6 +263,47 @@ class NixiAdapter(BasePlatformAdapter):
         finally:
             self._concurrency_semaphore.release()
 
+    def _get_overlay_with_cache(self, user_id: str) -> str:
+        """Return cached overlay for user_id, loading from disk on miss or expiry.
+
+        Cache semantics:
+        - Hit (entry exists, not expired): return cached value. O(1) lookup, no eviction.
+        - Miss (no entry): call load_overlay(), store result with current timestamp.
+        - Expired (entry exists but TTL elapsed): delete entry, fall through to miss path.
+        - Eviction on insert only: after inserting a new entry, if cache exceeds
+          _overlay_cache_max, first evict all expired entries, then evict oldest
+          (popitem(last=False) — insertion-order LRU) until under limit.
+        """
+        now = time.time()
+
+        # ── Cache hit path (O(1), no eviction) ───────────────────────────
+        if user_id in self._overlay_cache:
+            overlay_text, ts = self._overlay_cache[user_id]
+            if now - ts < self._overlay_cache_ttl:
+                return overlay_text
+            # Expired — remove and fall through to reload
+            del self._overlay_cache[user_id]
+
+        # ── Cache miss path: load from disk ──────────────────────────────
+        overlay_text = load_overlay(user_id)
+        self._overlay_cache[user_id] = (overlay_text, now)
+
+        # ── Eviction on insert ────────────────────────────────────────────
+        if len(self._overlay_cache) > self._overlay_cache_max:
+            # First pass: evict all expired entries
+            expired_keys = [
+                k for k, (_, ts) in self._overlay_cache.items()
+                if now - ts >= self._overlay_cache_ttl
+            ]
+            for k in expired_keys:
+                del self._overlay_cache[k]
+
+            # Second pass: if still over limit, evict oldest by insertion order
+            while len(self._overlay_cache) > self._overlay_cache_max:
+                self._overlay_cache.popitem(last=False)
+
+        return overlay_text
+
     async def _dispatch_event(
         self,
         event_data: Dict[str, Any],
@@ -257,8 +319,8 @@ class NixiAdapter(BasePlatformAdapter):
         channel = event.get("channel", "")
         thread_ts = event.get("thread_ts")
 
-        # Load employee overlay for ephemeral context injection
-        overlay = load_overlay(user_id)
+        # Load employee overlay for ephemeral context injection (cached)
+        overlay = self._get_overlay_with_cache(user_id)
 
         # Build session key and source
         chat_id = channel or f"nixi:{user_id}"

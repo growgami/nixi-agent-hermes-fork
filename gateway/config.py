@@ -1302,6 +1302,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             except ValueError:
                 pass  # Adapter falls back to default 10
 
+        # Overlay cache TTL (seconds) and max entries — config extra takes
+        # precedence; env var is fallback; defaults are 300s and 256 entries.
+        nixi_overlay_cache_ttl = os.getenv("NIXI_OVERLAY_CACHE_TTL", "")
+        if nixi_overlay_cache_ttl:
+            try:
+                config.platforms[Platform.NIXI].extra.setdefault("NIXI_OVERLAY_CACHE_TTL", int(nixi_overlay_cache_ttl))
+            except ValueError:
+                pass  # Adapter falls back to default 300s
+        nixi_overlay_cache_max = os.getenv("NIXI_OVERLAY_CACHE_MAX", "")
+        if nixi_overlay_cache_max:
+            try:
+                config.platforms[Platform.NIXI].extra.setdefault("NIXI_OVERLAY_CACHE_MAX", int(nixi_overlay_cache_max))
+            except ValueError:
+                pass  # Adapter falls back to default 256
+
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
     if idle_minutes:
