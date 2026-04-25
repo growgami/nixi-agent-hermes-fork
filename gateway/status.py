@@ -501,8 +501,8 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         if not stale:
             try:
                 os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError, OSError):
-                # Windows raises OSError with WinError 87 for invalid pid check
+            except (ProcessLookupError, PermissionError, OSError, SystemError):
+                # Windows: OSError with WinError 87 for invalid pid, SystemError for dead PIDs
                 stale = True
             else:
                 current_start = _get_process_start_time(existing_pid)
