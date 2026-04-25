@@ -1989,9 +1989,10 @@ class GatewayRunner:
                        "WECOM_ALLOWED_USERS",
                        "WECOM_CALLBACK_ALLOWED_USERS",
                        "WEIXIN_ALLOWED_USERS",
-                       "BLUEBUBBLES_ALLOWED_USERS",
-                       "QQ_ALLOWED_USERS",
-                       "GATEWAY_ALLOWED_USERS")
+                        "BLUEBUBBLES_ALLOWED_USERS",
+                        "QQ_ALLOWED_USERS",
+                        "NIXI_ALLOWED_USERS",
+                        "GATEWAY_ALLOWED_USERS")
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
             os.getenv(v, "").lower() in ("true", "1", "yes")
@@ -2004,8 +2005,9 @@ class GatewayRunner:
                        "WECOM_ALLOW_ALL_USERS",
                        "WECOM_CALLBACK_ALLOW_ALL_USERS",
                        "WEIXIN_ALLOW_ALL_USERS",
-                       "BLUEBUBBLES_ALLOW_ALL_USERS",
-                       "QQ_ALLOW_ALL_USERS")
+                        "BLUEBUBBLES_ALLOW_ALL_USERS",
+                        "QQ_ALLOW_ALL_USERS",
+                        "NIXI_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
@@ -2994,12 +2996,12 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        # Nixi: Auth is at two levels — (1) bearer token at adapter level
-        # validates Sludge connection, (2) workspace membership enforced by
-        # Sludge routing. Per-employee auth is at the workspace level, so
-        # per-user allowlisting is not needed here. Use NIXI_ALLOWED_USERS
-        # for future per-employee restriction.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NIXI):
+        # Nixi: bearer token authenticates the Sludge connection, but
+        # per-employee access can now be restricted via NIXI_ALLOWED_USERS
+        # when NIXI_ALLOW_ALL_USERS=false.  By default,
+        # NIXI_ALLOW_ALL_USERS=true preserves open access for existing
+        # deployments, or GATEWAY_ALLOW_ALL_USERS=true also works.
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
             return True
 
         user_id = source.user_id
@@ -3046,12 +3048,25 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.NIXI: "NIXI_ALLOW_ALL_USERS",
+        }
+
+        # Per-platform allow-all defaults — platforms whose allow-all flag
+        # defaults to "true" when the env var is unset, preserving backward
+        # compatibility with deployments that don't set the variable.
+        _allow_all_defaults = {
+            Platform.NIXI: "true",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
-            return True
+        if platform_allow_all_var:
+            allow_all_val = os.getenv(
+                platform_allow_all_var,
+                _allow_all_defaults.get(source.platform, ""),
+            )
+            if allow_all_val.lower() in ("true", "1", "yes"):
+                return True
 
         # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
         # filter are already authorized at the platform level — skip the
