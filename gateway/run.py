@@ -32,6 +32,7 @@ from datetime import datetime
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from gateway.platforms.helpers import MessageDeduplicator
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -712,6 +713,13 @@ class GatewayRunner:
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
         self._update_prompt_pending: Dict[str, bool] = {}
+
+        # Gateway-level message deduplication.  Defense-in-depth: even with
+        # the retry-loop race fix and adapter store sync, a network retry or
+        # task-scheduling edge case could still produce a duplicate.  The
+        # MessageDeduplicator uses TTL-based pruning (default 300 s) so stale
+        # entries expire automatically.
+        self._message_dedup = MessageDeduplicator()
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -3310,6 +3318,24 @@ class GatewayRunner:
                 _update_prompts.pop(_quick_key, None)
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
+
+        # ── Gateway-level idempotency check ───────────────────────────────
+        # Defense-in-depth: even with the retry-loop race fix and adapter
+        # store sync, a network retry or task-scheduling edge case could
+        # still produce a duplicate inbound message.  Drop it before any
+        # downstream processing runs.
+        _msg_id = getattr(event, "message_id", None)
+        if _msg_id:
+            _dedup_key = f"{_quick_key}:{_msg_id}"
+        else:
+            _normalized = re.sub(r"\s+", " ", (event.text or "").strip())
+            _dedup_key = f"{_quick_key}:{hash(_normalized)}"
+        if self._message_dedup.is_duplicate(_dedup_key):
+            logger.info(
+                "Dropping duplicate message for session %s (key=%s)",
+                _quick_key, _dedup_key,
+            )
+            return None
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -8770,6 +8796,14 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        # Clear gateway-level dedup cache so stale entries don't block
+        # legitimate retries after a session reset.  MessageDeduplicator
+        # tracks all sessions in a flat dict (no per-session partitioning),
+        # so we clear the whole cache — this is safe because session
+        # release is infrequent and the 300 s TTL handles natural expiry.
+        _dedup = getattr(self, "_message_dedup", None)
+        if _dedup is not None:
+            _dedup.clear()
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
