@@ -1292,6 +1292,15 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.NIXI].extra["port"] = int(nixi_port_str) if nixi_port_str else 8080
         except ValueError:
             config.platforms[Platform.NIXI].extra["port"] = 8080
+        nixi_concurrency_str = os.getenv("NIXI_CONCURRENCY_LIMIT", "")
+        if nixi_concurrency_str:
+            try:
+                val = int(nixi_concurrency_str)
+                if val < 1:
+                    val = 1
+                config.platforms[Platform.NIXI].extra["NIXI_CONCURRENCY_LIMIT"] = val
+            except ValueError:
+                pass  # Adapter falls back to default 10
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

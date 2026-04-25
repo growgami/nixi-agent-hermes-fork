@@ -69,6 +69,23 @@ class NixiAdapter(BasePlatformAdapter):
         )
         self._host: str = extra.get("host", DEFAULT_HOST)
         self._port: int = int(extra.get("port", DEFAULT_PORT))
+
+        # Concurrency limit: bounds concurrent handle_message() calls to
+        # prevent exhausting LLM API rate limits under concurrent load.
+        # Config extra takes precedence; env var is fallback; default is 10.
+        _concurrency_raw = extra.get("NIXI_CONCURRENCY_LIMIT")
+        if _concurrency_raw is None:
+            _concurrency_raw = os.getenv("NIXI_CONCURRENCY_LIMIT", "10")
+        try:
+            self._concurrency_limit: int = int(_concurrency_raw)
+        except (ValueError, TypeError):
+            self._concurrency_limit = 10
+        if self._concurrency_limit < 1:
+            self._concurrency_limit = 1
+        self._concurrency_semaphore: asyncio.Semaphore = asyncio.Semaphore(
+            self._concurrency_limit
+        )
+
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -119,10 +136,11 @@ class NixiAdapter(BasePlatformAdapter):
         await self._site.start()
         self._mark_connected()
         logger.info(
-            "[nixi] Listening on %s:%d (team_id=%s)",
+            "[nixi] Listening on %s:%d (team_id=%s, concurrency_limit=%d)",
             self._host,
             self._port,
             self._team_id or "(not set)",
+            self._concurrency_limit,
         )
         return True
 
@@ -210,6 +228,20 @@ class NixiAdapter(BasePlatformAdapter):
 
         return web.json_response({"status": "ok"}, status=200)
 
+    async def _run_with_semaphore(self, message_event: MessageEvent) -> None:
+        """Acquire the concurrency semaphore, call handle_message, and release on completion.
+
+        This bounds the number of simultaneous LLM API calls to
+        NIXI_CONCURRENCY_LIMIT (default 10), preventing rate limit exhaustion
+        under concurrent load. The semaphore is released in the finally block
+        so exceptions don't leak the permit.
+        """
+        await self._concurrency_semaphore.acquire()
+        try:
+            await self.handle_message(message_event)
+        finally:
+            self._concurrency_semaphore.release()
+
     async def _dispatch_event(
         self,
         event_data: Dict[str, Any],
@@ -255,8 +287,8 @@ class NixiAdapter(BasePlatformAdapter):
             len(overlay) if overlay else 0,
         )
 
-        # Non-blocking dispatch via handle_message
-        task = asyncio.create_task(self.handle_message(message_event))
+        # Non-blocking dispatch via handle_message, bounded by concurrency semaphore
+        task = asyncio.create_task(self._run_with_semaphore(message_event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
