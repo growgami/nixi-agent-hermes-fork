@@ -39,8 +39,40 @@ from gateway.platforms.helpers import MessageDeduplicator
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
 # memory providers, etc.).  LRU order + idle TTL eviction are enforced
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
-_AGENT_CACHE_MAX_SIZE = 128
+#
+# Cache size is configurable via NIXI_AGENT_CACHE_SIZE (default 128).
+# Lazy-initialized: the env var is read on first access, not at import
+# time, so tests can set it before the first call and reset the module
+# variable to None to restore the "not yet read" state.
+_AGENT_CACHE_MAX_SIZE: int | None = None
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+
+
+def _get_agent_cache_max_size() -> int:
+    """Return the maximum number of cached agent instances.
+
+    Reads NIXI_AGENT_CACHE_SIZE from the environment on first call,
+    then caches the result in the module-level _AGENT_CACHE_MAX_SIZE.
+    Falls back to 128 if the variable is unset or set to a non-integer
+    value.  A warning is logged for invalid values.
+    """
+    global _AGENT_CACHE_MAX_SIZE
+    if _AGENT_CACHE_MAX_SIZE is not None:
+        return _AGENT_CACHE_MAX_SIZE
+
+    raw = os.environ.get("NIXI_AGENT_CACHE_SIZE", "128")
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "NIXI_AGENT_CACHE_SIZE=%r is not a valid integer; "
+            "falling back to 128",
+            raw,
+        )
+        value = 128
+
+    _AGENT_CACHE_MAX_SIZE = value
+    return value
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -693,7 +725,7 @@ class GatewayRunner:
         #
         # OrderedDict so _enforce_agent_cache_cap() can pop the least-recently-
         # used entry (move_to_end() on cache hits, popitem(last=False) for
-        # eviction).  Hard cap via _AGENT_CACHE_MAX_SIZE, idle TTL enforced
+        # eviction).  Hard cap via _get_agent_cache_max_size(), idle TTL enforced
         # from _session_expiry_watcher().
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
@@ -8952,7 +8984,7 @@ class GatewayRunner:
             pass
 
     def _enforce_agent_cache_cap(self) -> None:
-        """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
+        """Evict oldest cached agents when cache exceeds _get_agent_cache_max_size().
 
         Must be called with _agent_cache_lock held.  Resource cleanup
         (memory provider shutdown, tool resource close) is scheduled
@@ -8992,7 +9024,8 @@ class GatewayRunner:
         # already-cached long-running one.  The cache may therefore stay
         # temporarily over cap; it will re-check on the next insert,
         # after active turns have finished.
-        excess = max(0, len(_cache) - _AGENT_CACHE_MAX_SIZE)
+        cap = _get_agent_cache_max_size()
+        excess = max(0, len(_cache) - cap)
         evict_plan: List[tuple] = []  # [(key, agent), ...]
         if excess > 0:
             ordered_keys = list(_cache.keys())
@@ -9006,12 +9039,12 @@ class GatewayRunner:
         for key, _ in evict_plan:
             _cache.pop(key, None)
 
-        remaining_over_cap = len(_cache) - _AGENT_CACHE_MAX_SIZE
+        remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:
             logger.warning(
                 "Agent cache over cap (%d > %d); %d excess slot(s) held by "
                 "mid-turn agents — will re-check on next insert.",
-                len(_cache), _AGENT_CACHE_MAX_SIZE, remaining_over_cap,
+                len(_cache), cap, remaining_over_cap,
             )
 
         for key, agent in evict_plan:

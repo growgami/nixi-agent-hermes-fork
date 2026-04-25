@@ -126,6 +126,16 @@ def _import_gateway():
     return start_gateway
 
 
+def _get_cache_size() -> int:
+    """Lazy import and call of _get_agent_cache_max_size from gateway.run.
+
+    Imports after NIXI_MODE is set to avoid import-time side effects.
+    """
+    from gateway.run import _get_agent_cache_max_size
+
+    return _get_agent_cache_max_size()
+
+
 def start_nixi() -> None:
     """Validate env, seed config, set NIXI_MODE, and start the gateway.
 
@@ -190,6 +200,25 @@ def start_nixi() -> None:
         port,
         home,
     )
+
+    # Step 3b: Log agent cache size and warn if misconfigured
+    cache_size = _get_cache_size()
+    logger.info("[nix] Agent cache max size: %d", cache_size)
+    print(f"  Cache Size: {cache_size}")
+    if cache_size < 16:
+        logger.warning(
+            "[nixi] NIXI_AGENT_CACHE_SIZE=%d is below recommended minimum (16); "
+            "agent cache may thrash under load",
+            cache_size,
+        )
+        print(f"  [WARN] Cache size {cache_size} is below recommended minimum (16)")
+    elif cache_size > 1024:
+        logger.warning(
+            "[nixi] NIXI_AGENT_CACHE_SIZE=%d exceeds recommended maximum (1024); "
+            "each cached agent holds LLM clients and tool schemas",
+            cache_size,
+        )
+        print(f"  [WARN] Cache size {cache_size} exceeds recommended maximum (1024)")
 
     # Step 4: Lazy import and start gateway
     print("  Starting gateway...")

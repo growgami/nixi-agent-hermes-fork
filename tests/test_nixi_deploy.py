@@ -242,9 +242,10 @@ class TestStartNixi:
             "HERMES_HOME": str(home),
         }, clear=True):
             with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
-                with patch("asyncio.run") as mock_asyncio_run:
-                    mock_asyncio_run.return_value = True
-                    start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run") as mock_asyncio_run:
+                        mock_asyncio_run.return_value = True
+                        start_nixi()
 
         # NIXI_MODE should have been set
         # (it was set within the function before gateway import)
@@ -266,9 +267,10 @@ class TestStartNixi:
             "HERMES_HOME": str(home),
         }, clear=True):
             with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
-                with patch("asyncio.run") as mock_asyncio_run:
-                    mock_asyncio_run.return_value = True
-                    start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run") as mock_asyncio_run:
+                        mock_asyncio_run.return_value = True
+                        start_nixi()
 
         # Config should not have been overwritten
         content = (home / "config.yaml").read_text(encoding="utf-8")
@@ -295,8 +297,9 @@ class TestStartNixi:
             "HERMES_HOME": str(home),
         }, clear=True):
             with patch("nixi.deploy._import_gateway", side_effect=mock_import_gateway):
-                with patch("asyncio.run", return_value=True):
-                    nixi.deploy.start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        nixi.deploy.start_nixi()
 
         # Gateway import should have seen NIXI_MODE=1
         assert call_order[0] == ("gateway_import", "1")
@@ -318,8 +321,9 @@ class TestStartNixi:
             "HERMES_HOME": str(home),
         }, clear=True):
             with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
-                with patch("asyncio.run", return_value=True):
-                    start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
 
         # Config should have been seeded
         assert (home / "config.yaml").exists()
@@ -343,9 +347,10 @@ class TestStartNixi:
             "NIXI_PORT": "9090",
         }, clear=True):
             with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
-                with patch("asyncio.run", return_value=True):
-                    with caplog.at_level(logging.INFO):
-                        start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        with caplog.at_level(logging.INFO):
+                            start_nixi()
 
         # Should log team_id and port info
         logged_messages = [r.message for r in caplog.records]
@@ -436,8 +441,9 @@ class TestStartNixiHomeChannel:
             "NIXI_HOME_CHANNEL": "C0AE0QVNT1P",
         }, clear=True):
             with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
-                with patch("asyncio.run", return_value=True):
-                    start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
 
         captured = capsys.readouterr()
         assert "C0AE0QVNT1P" in captured.out
@@ -459,11 +465,116 @@ class TestStartNixiHomeChannel:
         }, clear=True):
             os.environ.pop("NIXI_HOME_CHANNEL", None)
             with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
-                with patch("asyncio.run", return_value=True):
-                    start_nixi()
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
 
         captured = capsys.readouterr()
         assert "not set" in captured.out
+
+
+class TestStartNixiCacheSizeLogging:
+    """Tests for cache size logging in start_nixi startup."""
+
+    def test_cache_size_logged_in_banner(self, tmp_path, capsys):
+        """start_nixi prints Cache Size in startup banner."""
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=256):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
+
+        captured = capsys.readouterr()
+        assert "Cache Size: 256" in captured.out
+
+    def test_warns_on_cache_size_below_minimum(self, tmp_path, capsys, caplog):
+        """start_nixi warns when cache size is below 16."""
+        import logging as _logging
+
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=8):
+                    with patch("asyncio.run", return_value=True):
+                        with caplog.at_level(_logging.WARNING):
+                            start_nixi()
+
+        captured = capsys.readouterr()
+        assert "[WARN] Cache size 8 is below recommended minimum (16)" in captured.out
+        assert any("below recommended minimum" in r.message for r in caplog.records)
+
+    def test_warns_on_cache_size_above_maximum(self, tmp_path, capsys, caplog):
+        """start_nixi warns when cache size exceeds 1024."""
+        import logging as _logging
+
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=2048):
+                    with patch("asyncio.run", return_value=True):
+                        with caplog.at_level(_logging.WARNING):
+                            start_nixi()
+
+        captured = capsys.readouterr()
+        assert "[WARN] Cache size 2048 exceeds recommended maximum (1024)" in captured.out
+        assert any("exceeds recommended maximum" in r.message for r in caplog.records)
+
+    def test_no_warning_at_default_size(self, tmp_path, capsys):
+        """start_nixi does not warn at default cache size 128."""
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
+
+        captured = capsys.readouterr()
+        assert "[WARN]" not in captured.out
 
 
 import logging
