@@ -3616,6 +3616,12 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
                 self._pending_messages[_quick_key] = event.text
+            # Synchronize adapter's pending store with the full event so
+            # _dequeue_pending_event (which reads from adapter) finds the
+            # MessageEvent with all metadata intact.
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                merge_pending_message_event(adapter._pending_messages, _quick_key, event)
             return None
 
         # Check for commands
