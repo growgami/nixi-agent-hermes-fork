@@ -10742,6 +10742,36 @@ class GatewayRunner:
                         (_sc and getattr(_sc, "final_response_sent", False))
                         or _previewed
                     )
+                    # Retry loop: wait for the CancelledError handler's
+                    # best-effort edit to complete before deciding whether
+                    # to send a duplicate.  The handler may set
+                    # _final_response_sent=True after a brief delay.
+                    if not _already_streamed and _sc:
+                        try:
+                            for _retry_attempt in range(3):
+                                await asyncio.sleep(0.1)
+                                if getattr(_sc, "final_response_sent", False):
+                                    _already_streamed = True
+                                    logger.debug(
+                                        "Queued follow-up for session %s: race detected — "
+                                        "final_response_sent became True on retry attempt %d, "
+                                        "suppressing duplicate send.",
+                                        session_key[:20] if session_key else "?",
+                                        _retry_attempt + 1,
+                                    )
+                                    break
+                            if not _already_streamed:
+                                logger.debug(
+                                    "Queued follow-up for session %s: retry loop exhausted without "
+                                    "final_response_sent becoming True; fallback send will proceed.",
+                                    session_key[:20] if session_key else "?",
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "Queued follow-up for session %s: retry loop for final_response_sent failed: %s",
+                                session_key[:20] if session_key else "?",
+                                e,
+                            )
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:

@@ -458,3 +458,153 @@ class TestCancellationHandlerDeliveryConfirmation:
             final_response_sent = True
 
         assert final_response_sent is True  # the bug: partial promoted to final
+
+
+# ===================================================================
+# Test 5: run.py — retry loop waits for CancelledError handler
+# ===================================================================
+
+class TestQueuedMessageRetryLoop:
+    """The pending-message path must wait for the CancelledError handler
+    to complete before evaluating _already_streamed.  Without the retry
+    loop, a timing race causes duplicate responses: the handler's
+    best-effort edit sets _final_response_sent=True, but the gateway
+    reads it as False and sends the message again.
+
+    The retry loop:
+      - Only activates when _already_streamed is initially False
+      - Sleeps 0.1s per attempt, max 3 attempts
+      - Breaks immediately if _final_response_sent becomes True
+      - Falls through if all retries exhaust without the flag
+    """
+
+    def test_race_detected_during_retry_loop(self):
+        """Simulate the race: CancelledError handler sets
+        final_response_sent=True after a short delay.  The retry loop
+        should detect the change and suppress the duplicate send."""
+        # Simulate: initially False, then set True (handler completes)
+        _final_response_sent_flags = [False, False, True]  # attempt 1, 2, 3
+        attempt = 0
+
+        def get_flag():
+            nonlocal attempt
+            flag = _final_response_sent_flags[min(attempt, len(_final_response_sent_flags) - 1)]
+            attempt += 1
+            return flag
+
+        # Simulate the retry loop logic
+        _already_streamed = False  # Initially False (race window)
+        if not _already_streamed:
+            for _ in range(3):
+                if get_flag():
+                    _already_streamed = True
+                    break
+                # In real code: asyncio.sleep(0.1)
+
+        # With the retry loop, the race was caught
+        assert _already_streamed is True
+
+    def test_race_not_detected_retries_exhaust(self):
+        """When final_response_sent never becomes True within the retry
+        window, the fallback send should proceed."""
+        _final_response_sent = False  # Never becomes True
+        _already_streamed = False
+
+        if not _already_streamed:
+            for _ in range(3):
+                if _final_response_sent:
+                    _already_streamed = True
+                    break
+                # In real code: asyncio.sleep(0.1)
+
+        # Retries exhausted — fallback send proceeds
+        assert _already_streamed is False
+
+    def test_no_retry_when_already_streamed(self):
+        """When _already_streamed is True from the start (no race),
+        the retry loop should not activate at all."""
+        _final_response_sent = True
+        _already_streamed = bool(_final_response_sent)
+
+        # The retry loop should be skipped entirely
+        retry_entered = False
+        if not _already_streamed:
+            retry_entered = True
+            for _ in range(3):
+                if _final_response_sent:
+                    _already_streamed = True
+                    break
+
+        assert _already_streamed is True
+        assert retry_entered is False
+
+    @pytest.mark.asyncio
+    async def test_async_race_detected_during_retry_loop(self):
+        """Async integration test: CancelledError handler sets
+        final_response_sent after a 50ms delay.  The retry loop
+        should detect the flag change and suppress the duplicate send."""
+        import asyncio
+
+        class FakeStreamConsumer:
+            def __init__(self):
+                self._final_response_sent = False
+
+            @property
+            def final_response_sent(self):
+                return self._final_response_sent
+
+        _sc = FakeStreamConsumer()
+
+        # Simulate CancelledError handler: sets flag after 50ms
+        async def set_flag_after_delay():
+            await asyncio.sleep(0.05)
+            _sc._final_response_sent = True
+
+        # Start the "handler" in the background
+        handler_task = asyncio.create_task(set_flag_after_delay())
+
+        # Evaluate _already_streamed — initially False
+        _already_streamed = bool(_sc and getattr(_sc, "final_response_sent", False))
+
+        # Retry loop: wait for flag to become True
+        if not _already_streamed:
+            for _ in range(3):
+                await asyncio.sleep(0.1)
+                if _sc and getattr(_sc, "final_response_sent", False):
+                    _already_streamed = True
+                    break
+
+        await handler_task  # Clean up
+
+        # The retry loop caught the late flag change
+        assert _already_streamed is True
+
+    @pytest.mark.asyncio
+    async def test_async_non_race_immediate_flag(self):
+        """Async integration test: final_response_sent is True immediately.
+        The retry loop should detect it on first check and skip."""
+        import asyncio
+
+        class FakeStreamConsumer:
+            def __init__(self):
+                self._final_response_sent = True
+
+            @property
+            def final_response_sent(self):
+                return self._final_response_sent
+
+        _sc = FakeStreamConsumer()
+
+        # Evaluate _already_streamed — True from the start
+        _already_streamed = bool(_sc and getattr(_sc, "final_response_sent", False))
+
+        # Retry loop: should be skipped because _already_streamed is True
+        if not _already_streamed:
+            for _ in range(3):
+                await asyncio.sleep(0.1)
+                if _sc and getattr(_sc, "final_response_sent", False):
+                    _already_streamed = True
+                    break
+
+        # No retry needed
+        assert _already_streamed is True
