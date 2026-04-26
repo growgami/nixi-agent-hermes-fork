@@ -64,6 +64,7 @@ class ScrapedMessage:
         thread_ts: Thread timestamp (for thread replies).
         parent_ts: Parent message timestamp (for thread replies).
         is_bot: Whether the poster is a known bot.
+        source_file: Source log file path (or channel ID for synthetic sources).
         timestamp: ISO datetime string.
     """
 
@@ -76,6 +77,7 @@ class ScrapedMessage:
     thread_ts: str | None
     parent_ts: str | None
     is_bot: bool
+    source_file: str
     timestamp: str
 
 
