@@ -19,8 +19,9 @@ interplay of stream consumer state, retry loop evaluation, and dedup guard.
 
 import asyncio
 import sys
+import time
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
