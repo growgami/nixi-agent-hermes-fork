@@ -104,11 +104,13 @@ class NixiConfig:
         Env vars:
             NIXI_LOG_DIR: Path to slack_logs directory.
             NIXI_OUTPUT_DIR: Path to output directory.
-            NIXI_EXTRACTION_MODEL: LLM model for extraction.
-            HERMES_HOME: Base directory (used for default output_dir).
+            NIXI_EXTRACTION_BATCH_SIZE: Messages per extraction batch (default: 50).
+            NIXI_BOT_NAMES: JSON list of bot display names.
+            NIXI_COOCCURRENCE_THRESHOLD: Min co-occurrence count (default: 3).
+            NIXI_MEMORY_LIMIT: Max messages in working memory (default: 10000).
+            NIXI_EMPLOYEE_LIMIT: Max employee records (default: 1375).
+            NIXI_MODEL: LLM model for extraction (fallback: NIXI_EXTRACTION_MODEL).
         """
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-
         log_dir_str = os.environ.get("NIXI_LOG_DIR", "")
         if log_dir_str:
             log_dir = Path(log_dir_str)
@@ -121,10 +123,34 @@ class NixiConfig:
         else:
             output_dir = Path.home() / ".nixi" / "output"
 
-        extraction_model = os.environ.get("NIXI_EXTRACTION_MODEL", "")
+        # Extraction batch size
+        extraction_batch_size = int(os.environ.get("NIXI_EXTRACTION_BATCH_SIZE", "50"))
+
+        # Bot names — JSON list or fallback to defaults
+        bot_names_env = os.environ.get("NIXI_BOT_NAMES", "")
+        if bot_names_env:
+            import json
+            try:
+                bot_names = json.loads(bot_names_env)
+            except json.JSONDecodeError:
+                bot_names = list(_DEFAULT_BOT_NAMES)
+        else:
+            bot_names = list(_DEFAULT_BOT_NAMES)
+
+        cooccurrence_threshold = int(os.environ.get("NIXI_COOCCURRENCE_THRESHOLD", "3"))
+        memory_limit = int(os.environ.get("NIXI_MEMORY_LIMIT", "10000"))
+        employee_limit = int(os.environ.get("NIXI_EMPLOYEE_LIMIT", "1375"))
+
+        # NIXI_MODEL takes priority; NIXI_EXTRACTION_MODEL as fallback
+        extraction_model = os.environ.get("NIXI_MODEL", "") or os.environ.get("NIXI_EXTRACTION_MODEL", "")
 
         return cls(
             log_dir=log_dir,
             output_dir=output_dir,
+            extraction_batch_size=extraction_batch_size,
+            bot_names=bot_names,
+            cooccurrence_threshold=cooccurrence_threshold,
+            memory_limit=memory_limit,
+            employee_limit=employee_limit,
             extraction_model=extraction_model,
         )
