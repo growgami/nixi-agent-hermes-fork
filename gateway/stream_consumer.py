@@ -96,6 +96,7 @@ class GatewayStreamConsumer:
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         self._fallback_final_send = False
+        self._fallback_send_done = False  # Set by gateway runner after fallback adapter.send()
         self._fallback_prefix = ""
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
@@ -122,6 +123,16 @@ class GatewayStreamConsumer:
     def final_response_sent(self) -> bool:
         """True when the stream consumer delivered the final assistant reply."""
         return self._final_response_sent
+
+    def mark_fallback_sent(self):
+        """Signal that the gateway runner has already sent the fallback response.
+
+        Called by run.py after adapter.send() (success or failure) to prevent
+        the CancelledError handler from sending a duplicate. Stream consumers
+        are created fresh per _run_agent call and never reused across turns,
+        so this flag cannot become stale from a prior turn.
+        """
+        self._fallback_send_done = True
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -452,7 +463,14 @@ class GatewayStreamConsumer:
         except asyncio.CancelledError:
             # Best-effort final edit on cancellation
             _best_effort_ok = False
-            if self._accumulated and self._message_id:
+            if self._fallback_send_done:
+                # Gateway runner already delivered the fallback response —
+                # skip the best-effort edit to avoid duplicating on Slack.
+                logger.debug(
+                    "Stream consumer CancelledError: skipping best-effort send "
+                    "because gateway fallback already delivered the response."
+                )
+            elif self._accumulated and self._message_id:
                 try:
                     _best_effort_ok = bool(await self._send_or_edit(self._accumulated))
                 except Exception:
