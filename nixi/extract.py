@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from nixi.config import NixiConfig
-from nixi.db import ensure_schema, get_connection
+from nixi.db import ensure_schema, get_connection, get_unprocessed, get_unprocessed_channels
 from nixi.extraction.batch import ExtractionBatcher, LLMClient
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ def _check_db_populated(conn, config: NixiConfig) -> bool:
     return True
 
 
-async def run_extraction(config: NixiConfig | None = None) -> dict[str, Any]:
+async def run_extraction(config: NixiConfig | None = None, dry_run: bool = False) -> dict[str, Any]:
     """Run extraction across all channels with unprocessed messages.
 
     Creates DB schema if needed. If DB has no scraped_messages rows,
@@ -45,6 +45,7 @@ async def run_extraction(config: NixiConfig | None = None) -> dict[str, Any]:
     Args:
         config: NixiConfig with extraction settings. If None, loaded from
             hermes config or env vars.
+        dry_run: If True, show what would be extracted without making LLM calls.
 
     Returns:
         Dict with extraction summary or guidance if DB is empty.
@@ -63,6 +64,31 @@ async def run_extraction(config: NixiConfig | None = None) -> dict[str, Any]:
         if not _check_db_populated(conn, config):
             return {"status": "empty_db", "message": "Run nixi ingest first"}
 
+        if dry_run:
+            # In dry-run mode, report what would be extracted without calling LLM
+            channels = get_unprocessed_channels(conn)
+            total_messages = 0
+            channel_info: dict[str, Any] = {}
+            for ch_id in channels:
+                msgs = get_unprocessed(conn, ch_id, limit=1000)
+                channel_info[ch_id] = {
+                    "message_count": len(msgs),
+                    "status": "would_extract" if len(msgs) >= 20 else "would_skip",
+                }
+                total_messages += len(msgs)
+
+            print(f"\n[dry-run] {len(channels)} channels with unprocessed messages")
+            print(f"  Total messages: {total_messages}")
+            for ch_id, info in channel_info.items():
+                status = info["status"]
+                print(f"  {ch_id}: {info['message_count']} messages ({status})")
+
+            return {
+                "status": "dry_run",
+                "channels": channel_info,
+                "total_messages": total_messages,
+            }
+
         llm = LLMClient(config)
         batcher = ExtractionBatcher(config, conn, llm)
         result = await batcher.extract_all()
@@ -74,6 +100,7 @@ async def run_extraction(config: NixiConfig | None = None) -> dict[str, Any]:
 async def run_extraction_channel(
     channel_id: str,
     config: NixiConfig | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Run extraction for a single channel.
 
@@ -84,6 +111,7 @@ async def run_extraction_channel(
         channel_id: Slack channel ID to extract.
         config: NixiConfig with extraction settings. If None, loaded from
             hermes config or env vars.
+        dry_run: If True, show what would be extracted without making LLM calls.
 
     Returns:
         Dict with extraction results or guidance if DB is empty.
@@ -101,6 +129,15 @@ async def run_extraction_channel(
     try:
         if not _check_db_populated(conn, config):
             return {"status": "empty_db", "message": "Run nixi ingest first"}
+
+        if dry_run:
+            msgs = get_unprocessed(conn, channel_id, limit=1000)
+            print(f"\n[dry-run] Channel {channel_id}: {len(msgs)} messages would be extracted")
+            return {
+                "status": "dry_run",
+                "channel_id": channel_id,
+                "message_count": len(msgs),
+            }
 
         llm = LLMClient(config)
         batcher = ExtractionBatcher(config, conn, llm)

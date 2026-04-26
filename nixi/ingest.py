@@ -29,7 +29,7 @@ def _load_config() -> NixiConfig:
         return NixiConfig.from_env()
 
 
-async def run_ingestion(config: NixiConfig | None = None) -> dict[str, Any]:
+async def run_ingestion(config: NixiConfig | None = None, force: bool = False) -> dict[str, Any]:
     """Run full ingestion: walk log_dir, parse, insert into nixi_state.db.
 
     Creates DB schema if needed, then delegates to LogFileAdapter.ingest().
@@ -37,6 +37,7 @@ async def run_ingestion(config: NixiConfig | None = None) -> dict[str, Any]:
     Args:
         config: NixiConfig with extraction settings. If None, loaded from
             hermes config or env vars.
+        force: If True, re-parse already-ingested data.
 
     Returns:
         Dict with ingestion summary (total_lines, parsed, inserted, etc.).
@@ -48,7 +49,7 @@ async def run_ingestion(config: NixiConfig | None = None) -> dict[str, Any]:
     ensure_schema(config.db_path)
 
     adapter = LogFileAdapter(config=config)
-    result = adapter.ingest()
+    result = adapter.ingest(force=force)
 
     # Convert IngestionResult to dict for CLI output
     summary = {
