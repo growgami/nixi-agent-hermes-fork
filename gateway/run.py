@@ -10874,6 +10874,13 @@ class GatewayRunner:
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                        finally:
+                            if _sc:
+                                _sc.mark_fallback_sent()
+                                logger.debug(
+                                    "Queued follow-up for session %s: fallback send completed, marking stream consumer to skip CancelledError handler.",
+                                    session_key[:20] if session_key else "?",
+                                )
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
