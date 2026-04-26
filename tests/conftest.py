@@ -461,3 +461,56 @@ def _enforce_test_timeout():
     yield
     signal.alarm(0)
     signal.signal(signal.SIGALRM, old)
+
+
+# ── Nixi extraction pipeline fixtures ─────────────────────────────────────────
+
+
+@pytest.fixture()
+def nixi_hermes_home(tmp_path, monkeypatch):
+    """Temp HERMES_HOME directory with nixi extraction structure for testing."""
+    home = tmp_path / "hermes_test"
+    home.mkdir()
+    (home / "sessions").mkdir()
+    (home / "nixi" / "output").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+@pytest.fixture()
+def nixi_config(nixi_hermes_home):
+    """NixiConfig pointed at the temp HERMES_HOME."""
+    from nixi.config import NixiConfig
+
+    return NixiConfig.from_config(nixi_hermes_home / "config.yaml")
+
+
+@pytest.fixture()
+def nixi_config_from_env(tmp_path, monkeypatch):
+    """NixiConfig from environment variables (standalone mode)."""
+    from nixi.config import NixiConfig
+
+    log_dir = tmp_path / "slack_logs"
+    log_dir.mkdir()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.setenv("NIXI_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("NIXI_OUTPUT_DIR", str(output_dir))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    return NixiConfig.from_env()
+
+
+@pytest.fixture()
+def sample_log_data(tmp_path):
+    """Sample Slack log data matching the real format for parser tests."""
+    log_file = tmp_path / "2025-12.log"
+    log_file.write_text(
+        "[1766766571.412779] @Kuro: hello world\n"
+        "[1766775007.615089] @Jin: check <@U04K8NLDCG0>\n"
+        "[1766775007.999999] (thread:1766766571.412779) @OG: thread reply here\n"
+        "[1766780001.123456] @Riya: multi-line\n"
+        "message continues\n"
+        "[1766789999.000001] @Toothless: I'm a bot\n",
+        encoding="utf-8",
+    )
+    return log_file

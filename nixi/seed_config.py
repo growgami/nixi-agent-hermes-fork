@@ -38,6 +38,17 @@ def generate_seed_config(
     if home_channel:
         nixi_section["home_channel"] = home_channel
 
+    # Extraction pipeline defaults under nixi: section
+    nixi_extraction: dict = {
+        "log_dir": "",  # resolved at runtime from HERMES_HOME or ~/.nixi
+        "output_dir": "",  # resolved at runtime from HERMES_HOME or ~/.nixi/output
+        "extraction_batch_size": 50,
+        "bot_names": ["Fixi", ".OP", "Toothless", "Cerberus"],
+        "cooccurrence_threshold": 3,
+        "memory_limit": 10000,
+        "employee_limit": 1375,
+    }
+
     return {
         "_config_version": config_version,
         "model": model,
@@ -55,4 +66,5 @@ def generate_seed_config(
             "backend": "local",
             "timeout": 180,
         },
+        "nixi": nixi_extraction,
     }
