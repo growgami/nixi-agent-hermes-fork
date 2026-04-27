@@ -37,6 +37,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.helpers import MessageDeduplicator
 
 from nixi.employee_provider import load_overlay
 
@@ -106,6 +107,12 @@ class NixiAdapter(BasePlatformAdapter):
             self._overlay_cache_max: int = int(_max_raw)
         except (ValueError, TypeError):
             self._overlay_cache_max = 256
+
+        # Deduplication: prevents duplicate processing of events with the same
+        # event_ts (e.g. Slack Socket Mode reconnect redeliveries or network
+        # retries). Per-adapter-instance, consistent with single-tenant-per-
+        # Machine architecture.
+        self._dedup = MessageDeduplicator()
 
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -315,6 +322,20 @@ class NixiAdapter(BasePlatformAdapter):
         # Sludge sends the full Slack event envelope; the relevant fields
         # are in event_data itself or event_data.get("event", {})
         event = event_data.get("event", event_data)
+
+        # Slack event field mapping: message events have both 'event_ts' and
+        # 'ts' (typically equal). Use event_ts first (more specific), fall back
+        # to ts. Since app_mention is filtered in Sludge, only message events
+        # reach here.
+        event_ts = event.get("event_ts") or event.get("ts", "")
+
+        # Synchronous dedup check BEFORE asyncio.create_task to prevent the
+        # race condition where two events pass the check before either is
+        # recorded.
+        if event_ts and self._dedup.is_duplicate(event_ts):
+            logger.info("[nixi] Skipping duplicate event: event_ts=%s", event_ts)
+            return
+
         text = event.get("text", "")
         channel = event.get("channel", "")
         thread_ts = event.get("thread_ts")
@@ -338,6 +359,7 @@ class NixiAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=event_data,
+            message_id=event_ts or None,
             channel_prompt=overlay if overlay else None,
         )
 

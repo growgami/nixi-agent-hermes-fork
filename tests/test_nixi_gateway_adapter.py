@@ -690,3 +690,106 @@ class TestBadRequestHandling:
                 },
             )
             assert resp.status == 400
+
+
+# ─── Deduplication ────────────────────────────────────────────────────────
+
+
+class TestDeduplication:
+    """Tests for MessageDeduplicator integration in _dispatch_event."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_duplicate_event_ts(self, nixi_adapter):
+        """Duplicate event_ts should be skipped — only one MessageEvent dispatched."""
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            called_events = []
+
+            async def capture_event(event):
+                called_events.append(event)
+                return "response"
+
+            nixi_adapter._message_handler = capture_event
+
+            event_data = {"event": {"text": "hello", "channel": "C123", "event_ts": "1234567890.123456"}}
+
+            # First dispatch — should process normally
+            await nixi_adapter._dispatch_event(event_data, user_id="U1", user_name="User1")
+            await asyncio.sleep(0.1)
+            assert len(called_events) == 1
+
+            # Second dispatch with same event_ts — should be deduplicated
+            await nixi_adapter._dispatch_event(event_data, user_id="U1", user_name="User1")
+            await asyncio.sleep(0.1)
+            assert len(called_events) == 1  # Still 1, not 2
+
+    @pytest.mark.asyncio
+    async def test_dispatch_allows_different_event_ts(self, nixi_adapter):
+        """Different event_ts values should both be processed."""
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            called_events = []
+
+            async def capture_event(event):
+                called_events.append(event)
+                return "response"
+
+            nixi_adapter._message_handler = capture_event
+
+            await nixi_adapter._dispatch_event(
+                {"event": {"text": "msg1", "channel": "C123", "event_ts": "1111111111.111111"}},
+                user_id="U1",
+                user_name="User1",
+            )
+            await asyncio.sleep(0.1)
+
+            await nixi_adapter._dispatch_event(
+                {"event": {"text": "msg2", "channel": "C123", "event_ts": "2222222222.222222"}},
+                user_id="U1",
+                user_name="User1",
+            )
+            await asyncio.sleep(0.1)
+
+            assert len(called_events) == 2
+
+    @pytest.mark.asyncio
+    async def test_dispatch_missing_event_ts_still_processes(self, nixi_adapter):
+        """Events with no event_ts or ts should still be processed (dedup skipped for empty keys)."""
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            called_events = []
+
+            async def capture_event(event):
+                called_events.append(event)
+                return "response"
+
+            nixi_adapter._message_handler = capture_event
+
+            await nixi_adapter._dispatch_event(
+                {"event": {"text": "no ts field", "channel": "C123"}},
+                user_id="U1",
+                user_name="User1",
+            )
+            await asyncio.sleep(0.1)
+
+            assert len(called_events) == 1
+            assert called_events[0].text == "no ts field"
+
+    @pytest.mark.asyncio
+    async def test_message_id_populated_from_event_ts(self, nixi_adapter):
+        """MessageEvent.message_id should be set to the event_ts value."""
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            called_events = []
+
+            async def capture_event(event):
+                called_events.append(event)
+                return "response"
+
+            nixi_adapter._message_handler = capture_event
+
+            await nixi_adapter._dispatch_event(
+                {"event": {"text": "hello", "channel": "C123", "event_ts": "1234567890.654321"}},
+                user_id="U1",
+                user_name="User1",
+            )
+            await asyncio.sleep(0.1)
+
+            assert len(called_events) == 1
+            assert called_events[0].message_id == "1234567890.654321"
