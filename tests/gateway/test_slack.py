@@ -2207,3 +2207,267 @@ class TestNixiSendOnlyMode:
 
         assert adapter._primary_client is None  # Should stay None in normal mode
         assert adapter._app is not None
+
+
+# ---------------------------------------------------------------------------
+# TestSocketHealthMonitor
+# ---------------------------------------------------------------------------
+
+class TestSocketHealthMonitor:
+    """Verify Socket Mode connection lifecycle and health monitoring."""
+
+    def test_init_has_socket_connected_and_health_monitor(self):
+        """__init__ should initialize _socket_connected=False and _health_monitor_task=None."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        assert adapter._socket_connected is False
+        assert adapter._health_monitor_task is None
+
+    @pytest.mark.asyncio
+    async def test_connect_registers_on_close_listener(self):
+        """connect() should register an on_close listener on the handler's client."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_app = MagicMock()
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "team_id": "T_TEST",
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team": "TestTeam",
+        })
+
+        mock_handler_client = MagicMock()
+        mock_handler_client.on_close_listeners = []
+        mock_handler = MagicMock()
+        mock_handler.client = mock_handler_client
+        mock_handler.start_async = AsyncMock()
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=mock_handler), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)):
+            os.environ.pop("NIXI_MODE", None)
+            result = await adapter.connect()
+
+        assert result is True
+        # The on_close listener should have been registered
+        assert len(mock_handler_client.on_close_listeners) >= 1
+
+    @pytest.mark.asyncio
+    async def test_connect_no_longer_sets_running_true_immediately(self):
+        """connect() should NOT set _running=True immediately — _mark_connected() does it via health monitor."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_app = MagicMock()
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "team_id": "T_TEST",
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team": "TestTeam",
+        })
+
+        mock_handler_client = MagicMock()
+        mock_handler_client.on_close_listeners = []
+        mock_handler_client.is_connected = AsyncMock(return_value=False)
+        mock_handler = MagicMock()
+        mock_handler.client = mock_handler_client
+        mock_handler.start_async = AsyncMock()
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=mock_handler), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)):
+            os.environ.pop("NIXI_MODE", None)
+            result = await adapter.connect()
+
+        assert result is True
+        # _running should be False because _mark_connected() hasn't been called yet
+        # (health monitor hasn't detected connection)
+        assert adapter._running is False
+
+    @pytest.mark.asyncio
+    async def test_connect_creates_health_monitor_task(self):
+        """connect() should create a health monitor task."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        mock_app = MagicMock()
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "team_id": "T_TEST",
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team": "TestTeam",
+        })
+
+        mock_handler_client = MagicMock()
+        mock_handler_client.on_close_listeners = []
+        mock_handler = MagicMock()
+        mock_handler.client = mock_handler_client
+        mock_handler.start_async = AsyncMock()
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=mock_handler), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)):
+            os.environ.pop("NIXI_MODE", None)
+            result = await adapter.connect()
+
+        assert result is True
+        assert adapter._health_monitor_task is not None
+        # Clean up the health monitor task
+        adapter._health_monitor_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_on_close_listener_marks_disconnected(self):
+        """The on_close listener should set _socket_connected=False and call _mark_disconnected()."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        adapter._running = True
+        adapter._socket_connected = True
+
+        mock_app = MagicMock()
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "team_id": "T_TEST",
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team": "TestTeam",
+        })
+
+        captured_listeners = []
+        mock_handler_client = MagicMock()
+        mock_handler_client.on_close_listeners = captured_listeners
+        mock_handler = MagicMock()
+        mock_handler.client = mock_handler_client
+        mock_handler.start_async = AsyncMock()
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=mock_handler), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.write_runtime_status"):
+            os.environ.pop("NIXI_MODE", None)
+            result = await adapter.connect()
+
+        assert result is True
+        assert len(captured_listeners) == 1
+
+        # Simulate WebSocket close
+        adapter._socket_connected = True
+        adapter._running = True
+        await captured_listeners[0]()
+
+        assert adapter._socket_connected is False
+        assert adapter._running is False
+
+    @pytest.mark.asyncio
+    async def test_health_monitor_detects_connection(self):
+        """Health monitor should call _mark_connected() when is_connected() returns True."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        adapter._handler = MagicMock()
+        adapter._handler.client.is_connected = AsyncMock(return_value=True)
+        adapter._app = MagicMock()
+        adapter._socket_connected = False
+        adapter._running = True
+        adapter._socket_mode_task = asyncio.create_task(asyncio.sleep(100))  # Not done
+
+        with patch.object(adapter, "_mark_connected") as mock_mark_connected:
+            await adapter._socket_health_monitor()
+            # _mark_connected should be called because transition from False→True
+            mock_mark_connected.assert_called_once()
+
+        adapter._socket_mode_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_health_monitor_detects_disconnection(self):
+        """Health monitor should call _mark_disconnected() when is_connected() returns False but we thought connected."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        adapter._handler = MagicMock()
+        adapter._handler.client.is_connected = AsyncMock(return_value=False)
+        adapter._app = MagicMock()
+        adapter._socket_connected = True
+        adapter._running = True
+        adapter._socket_mode_task = asyncio.create_task(asyncio.sleep(100))  # Not done
+
+        with patch.object(adapter, "_mark_disconnected") as mock_mark_disconnected:
+            await adapter._socket_health_monitor()
+            # _mark_disconnected should be called because transition from True→False
+            mock_mark_disconnected.assert_called_once()
+
+        adapter._socket_mode_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_health_monitor_signals_fatal_error_on_dead_task(self):
+        """Health monitor should set fatal error when socket mode task is done but _running is True."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        # Create a task that completes immediately
+        async def _quick_done():
+            pass
+        adapter._socket_mode_task = asyncio.create_task(_quick_done())
+        await adapter._socket_mode_task  # Ensure it's done
+        adapter._running = True
+
+        with patch.object(adapter, "_set_fatal_error") as mock_fatal:
+            await adapter._socket_health_monitor()
+            mock_fatal.assert_called_once_with(
+                "socket_mode_dead",
+                "Socket Mode task terminated",
+                retryable=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_health_monitor(self):
+        """disconnect() should cancel the health monitor task."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        # Simulate a connected adapter
+        adapter._handler = MagicMock()
+        adapter._handler.close_async = AsyncMock()
+        adapter._running = True
+        adapter._socket_connected = True
+        adapter._health_monitor_task = asyncio.create_task(asyncio.sleep(100))
+        adapter._platform_lock_scope = "slack-app-token"
+        adapter._platform_lock_identity = "xapp-fake"
+
+        with patch("gateway.status.release_scoped_lock"):
+            await adapter.disconnect()
+
+        # Health monitor task should be cancelled and set to None
+        assert adapter._health_monitor_task is None
+        assert adapter._socket_connected is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_sets_socket_connected_false(self):
+        """disconnect() should set _socket_connected=False and _running=False."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        adapter._handler = MagicMock()
+        adapter._handler.close_async = AsyncMock()
+        adapter._running = True
+        adapter._socket_connected = True
+        adapter._platform_lock_scope = "slack-app-token"
+        adapter._platform_lock_identity = "xapp-fake"
+
+        with patch("gateway.status.release_scoped_lock"):
+            await adapter.disconnect()
+
+        assert adapter._socket_connected is False
+        assert adapter._running is False

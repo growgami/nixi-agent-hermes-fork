@@ -88,6 +88,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._bot_user_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
         self._socket_mode_task: Optional[asyncio.Task] = None
+        self._socket_connected: bool = False
+        self._health_monitor_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, AsyncWebClient] = {}   # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
@@ -236,11 +238,24 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token)
-            self._socket_mode_task = asyncio.create_task(self._handler.start_async())
 
-            self._running = True
+            # Register WebSocket lifecycle listeners on the underlying client.
+            # on_close fires when the WebSocket disconnects (clean or
+            # abnormal).  There is no on_open callback in the aiohttp
+            # transport — connection state is tracked via the health
+            # monitor polling is_connected().
+            async def _on_socket_close(message=None):
+                self._socket_connected = False
+                self._mark_disconnected()
+                logger.warning("[Slack] Socket Mode WebSocket disconnected")
+
+            self._handler.client.on_close_listeners.append(_on_socket_close)
+
+            self._socket_mode_task = asyncio.create_task(self._handler.start_async())
+            self._health_monitor_task = asyncio.create_task(self._socket_health_monitor())
+
             logger.info(
-                "[Slack] Socket Mode connected (%d workspace(s))",
+                "[Slack] Socket Mode connecting... (%d workspace(s))",
                 len(self._team_clients),
             )
             return True
@@ -321,16 +336,70 @@ class SlackAdapter(BasePlatformAdapter):
             logger.info("[Slack] Disconnected (Nixi mode)")
             return
 
+        # Cancel health monitor
+        if self._health_monitor_task is not None:
+            self._health_monitor_task.cancel()
+            self._health_monitor_task = None
+
         if self._handler:
             try:
                 await self._handler.close_async()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[Slack] Error while closing Socket Mode handler: %s", e, exc_info=True)
+
+        self._socket_connected = False
         self._running = False
 
         self._release_platform_lock()
 
         logger.info("[Slack] Disconnected")
+
+    async def _socket_health_monitor(self) -> None:
+        """Periodically check Socket Mode connection health.
+
+        Runs every 30 seconds. Detects:
+        - Socket Mode task dying unexpectedly (signals fatal error to gateway runner)
+        - Silent WebSocket disconnections (stale state detection)
+        - Successful WebSocket connections (marks connected)
+        """
+        while True:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return
+
+            try:
+                # Check 1: Socket Mode task died unexpectedly
+                if self._socket_mode_task is not None and self._socket_mode_task.done():
+                    if self._running:
+                        logger.error("[Slack] Socket Mode task terminated unexpectedly")
+                        self._set_fatal_error(
+                            "socket_mode_dead",
+                            "Socket Mode task terminated",
+                            retryable=True,
+                        )
+                    return  # Health monitor stops; gateway runner handles reconnection
+
+                # Check 2: Detect silent disconnection via is_connected()
+                if self._handler is not None and self._app is not None:
+                    try:
+                        connected = await self._handler.client.is_connected()
+                    except Exception:
+                        connected = False
+
+                    if connected and not self._socket_connected:
+                        # WebSocket just came online (initial connect or reconnect)
+                        self._socket_connected = True
+                        self._mark_connected()
+                        logger.info("[Slack] Socket Mode WebSocket connected")
+                    elif not connected and self._socket_connected:
+                        # Client reports disconnected but we thought we were connected
+                        self._socket_connected = False
+                        self._mark_disconnected()
+                        logger.warning("[Slack] Socket Mode WebSocket disconnected (detected by health monitor)")
+
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.error("[Slack] Health monitor error: %s", e, exc_info=True)
 
     def _get_client(self, chat_id: str) -> AsyncWebClient:
         """Return the workspace-specific WebClient for a channel."""
