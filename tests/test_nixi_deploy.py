@@ -330,6 +330,119 @@ class TestStartNixi:
         assert (home / "SOUL.md").exists()
         assert (home / "AGENTS.md").exists()
 
+    def test_always_rewrites_soul_md_on_boot(self, tmp_path):
+        """SOUL.md is overwritten from template even when config.yaml exists."""
+        from nixi.config_seeder import DEFAULT_SOUL_MD
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        # Pre-existing config.yaml — seed_if_needed will skip (early return).
+        (home / "config.yaml").write_text("model: existing-model\n", encoding="utf-8")
+
+        # Pre-existing SOUL.md with stale content.
+        (home / "SOUL.md").write_text("# Old personality", encoding="utf-8")
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
+
+        # SOUL.md was overwritten with the new template content.
+        soul_content = (home / "SOUL.md").read_text(encoding="utf-8")
+        assert "the person in the room" in soul_content
+        assert "# Old personality" not in soul_content
+
+        # config.yaml was NOT overwritten (still has the custom content).
+        config_content = (home / "config.yaml").read_text(encoding="utf-8")
+        assert "existing-model" in config_content
+
+    def test_first_seed_writes_new_soul_md(self, tmp_path):
+        """On first seed, SOUL.md content matches DEFAULT_SOUL_MD exactly."""
+        from nixi.config_seeder import DEFAULT_SOUL_MD
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+        # No config.yaml — first seed path.
+
+        mock_gateway = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        start_nixi()
+
+        # SOUL.md exists and matches DEFAULT_SOUL_MD exactly.
+        assert (home / "SOUL.md").exists()
+        soul_content = (home / "SOUL.md").read_text(encoding="utf-8")
+        assert soul_content == DEFAULT_SOUL_MD
+
+        # config.yaml was seeded (standard behavior).
+        config_content = (home / "config.yaml").read_text(encoding="utf-8")
+        assert "_config_version" in config_content
+
+    def test_soul_md_write_failure_non_fatal(self, tmp_path, caplog):
+        """SOUL.md write failure doesn't crash gateway startup."""
+        import logging as _logging
+
+        from nixi.deploy import start_nixi
+
+        home = tmp_path / "tenant"
+        home.mkdir()
+
+        # Pre-existing config.yaml — seed_if_needed will skip.
+        (home / "config.yaml").write_text("model: my-model\n", encoding="utf-8")
+
+        # Pre-existing SOUL.md.
+        (home / "SOUL.md").write_text("# Original", encoding="utf-8")
+
+        mock_gateway = MagicMock()
+        soul_path = home / "SOUL.md"
+
+        original_write_text = Path.write_text
+
+        def selective_write_text(self, content, **kwargs):
+            if self == soul_path:
+                raise PermissionError("permission denied")
+            return original_write_text(self, content, **kwargs)
+
+        with patch.dict(os.environ, {
+            "NIXI_INTERNAL_SECRET": "secret123",
+            "NIXI_TEAM_ID": "T_TEST",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "HERMES_HOME": str(home),
+        }, clear=True):
+            with patch("nixi.deploy._import_gateway", return_value=mock_gateway):
+                with patch("nixi.deploy._get_cache_size", return_value=128):
+                    with patch("asyncio.run", return_value=True):
+                        with patch.object(Path, "write_text", selective_write_text):
+                            with caplog.at_level(_logging.WARNING):
+                                # Must NOT raise.
+                                start_nixi()
+
+        # Gateway startup succeeded (didn't raise).
+        # Original SOUL.md content unchanged (write failed).
+        assert (home / "SOUL.md").read_text(encoding="utf-8") == "# Original"
+
+        # Warning was logged.
+        assert any("Failed to rewrite SOUL.md" in r.message for r in caplog.records)
+
     def test_logs_startup_message(self, tmp_path, caplog):
         """start_nixi logs team_id and port on startup."""
         from nixi.deploy import start_nixi
