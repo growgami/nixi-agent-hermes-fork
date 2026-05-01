@@ -22,6 +22,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from nixi.config_seeder import DEFAULT_SOUL_MD
+
 logger = logging.getLogger(__name__)
 
 # ── Load .env before any env var reads ─────────────────────────────────────
@@ -182,6 +184,18 @@ def start_nixi() -> None:
     # Step 2: Seed config if needed
     config_path = home / "config.yaml"
     seed_if_needed(home)
+
+    # Always rewrite SOUL.md from template on boot.
+    # SOUL.md is org-controlled — not intended for per-tenant customization.
+    # Custom instructions belong in AGENTS.md.
+    # Takes effect on next deploy (new container), not on running instances.
+    try:
+        soul_path = home / "SOUL.md"
+        soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+        logger.info("[nixi] Rewrote SOUL.md from template")
+    except (PermissionError, OSError) as exc:
+        logger.warning("[nixi] Failed to rewrite SOUL.md: %s", exc)
+        # Non-fatal: agent functions without SOUL.md (falls back to built-in default identity)
 
     if config_path.exists():
         print(f"  Config:     {config_path} (existing)")
