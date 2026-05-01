@@ -6621,7 +6621,13 @@ class GatewayRunner:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
-        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _thread_metadata: Optional[Dict[str, Any]] = {}
+        if source.thread_id:
+            _thread_metadata["thread_id"] = source.thread_id
+        if source.message_id:
+            _thread_metadata["message_id"] = source.message_id
+        if source.user_id:
+            _thread_metadata["user_id"] = source.user_id
 
         try:
             user_config = _load_gateway_config()
@@ -9233,10 +9239,13 @@ class GatewayRunner:
             else bool(_plat_streaming)
         )
 
+        _thread_metadata: Optional[Dict[str, Any]] = {}
         if source.thread_id:
-            _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id}
-        else:
-            _thread_metadata = None
+            _thread_metadata["thread_id"] = source.thread_id
+        if source.message_id:
+            _thread_metadata["message_id"] = source.message_id
+        if source.user_id:
+            _thread_metadata["user_id"] = source.user_id
 
         if _streaming_enabled:
             try:
@@ -9751,7 +9760,13 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _status_thread_metadata: Optional[Dict[str, Any]] = {}
+        if _progress_thread_id:
+            _status_thread_metadata["thread_id"] = _progress_thread_id
+        if source.message_id:
+            _status_thread_metadata["message_id"] = source.message_id
+        if source.user_id:
+            _status_thread_metadata["user_id"] = source.user_id
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():

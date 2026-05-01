@@ -615,10 +615,129 @@ class TestSendTyping:
             status="is thinking...",
         )
 
+    @pytest.mark.asyncio
+    async def test_uses_message_id_fallback_when_no_thread_id(self, adapter):
+        """When thread_id is absent but message_id is present, use message_id as thread_ts."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata={"message_id": "1234567890.123456"})
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="1234567890.123456",
+            status="is thinking...",
+        )
 
-# ---------------------------------------------------------------------------
-# TestFormatMessage — Markdown → mrkdwn conversion
-# ---------------------------------------------------------------------------
+    @pytest.mark.asyncio
+    async def test_thread_id_takes_precedence_over_message_id(self, adapter):
+        """thread_id should be preferred over message_id when both are present."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata={"thread_id": "thread_ts", "message_id": "msg_ts"})
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="thread_ts",
+            status="is thinking...",
+        )
+
+    @pytest.mark.asyncio
+    async def test_noop_without_thread_id_or_message_id(self, adapter):
+        """No API call when neither thread_id nor message_id is available."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata={"user_id": "U999"})
+        adapter._app.client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_with_empty_metadata(self, adapter):
+        """No API call with empty metadata dict."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata={})
+        adapter._app.client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tracks_active_status_thread_with_message_id(self, adapter):
+        """_active_status_threads should track the resolved thread_ts even from message_id."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata={"message_id": "1234567890.123456"})
+        assert adapter._active_status_threads["C123"] == "1234567890.123456"
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_warning_logs_once_per_chat_id(self, adapter, caplog):
+        """WARNING log should appear once per chat_id, then DEBUG on repeats."""
+        import logging
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("some_error")
+        )
+        with caplog.at_level(logging.WARNING, logger="gateway.platforms.slack"):
+            await adapter.send_typing("C123", metadata={"thread_id": "ts1"})
+            await adapter.send_typing("C123", metadata={"thread_id": "ts2"})
+        # First call should log WARNING, second should only log DEBUG
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING and "some_error" in r.message]
+        assert len(warning_records) == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_scope_suppressed_permanently(self, adapter, caplog):
+        """missing_scope/invalid_auth errors should be logged once then suppressed."""
+        import logging
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("missing_scope")
+        )
+        with caplog.at_level(logging.DEBUG, logger="gateway.platforms.slack"):
+            await adapter.send_typing("C456", metadata={"thread_id": "ts1"})
+            await adapter.send_typing("C456", metadata={"thread_id": "ts2"})
+        # Only one log entry about missing_scope (INFO level)
+        scope_records = [r for r in caplog.records if "missing_scope" in r.message]
+        assert len(scope_records) == 1
+
+    @pytest.mark.asyncio
+    async def test_clears_setStatus_warned_on_success(self, adapter):
+        """Successful setStatus should remove chat_id from _setStatus_warned."""
+        adapter._setStatus_warned.add("C789")
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C789", metadata={"thread_id": "ts1"})
+        assert "C789" not in adapter._setStatus_warned
+
+
+class TestStopTyping:
+    """Test stop_typing clearing the assistant thread status indicator."""
+
+    @pytest.mark.asyncio
+    async def test_clears_status_on_stop(self, adapter):
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        # First set the indicator
+        adapter._active_status_threads["C123"] = "thread_ts_1"
+        await adapter.stop_typing("C123")
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="thread_ts_1",
+            status="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_active_status(self, adapter):
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.stop_typing("C999")
+        adapter._app.client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_clear_logging(self, adapter, caplog):
+        """stop_typing should rate-limit warning logs like send_typing."""
+        import logging
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("some_error")
+        )
+        adapter._active_status_threads["C123"] = "ts1"
+        with caplog.at_level(logging.WARNING, logger="gateway.platforms.slack"):
+            await adapter.stop_typing("C123")
+            # Second call won't have _active_status_threads set, but let's test the warn logic
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING and "some_error" in r.message]
+        assert len(warning_records) == 1
+
+    @pytest.mark.asyncio
+    async def test_clears_warned_on_successful_clear(self, adapter):
+        """Successful clear should remove chat_id from _setStatus_warned."""
+        adapter._setStatus_warned.add("C123")
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter._active_status_threads["C123"] = "ts1"
+        await adapter.stop_typing("C123")
+        assert "C123" not in adapter._setStatus_warned
 
 
 class TestFormatMessage:

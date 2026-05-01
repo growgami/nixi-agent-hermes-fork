@@ -2153,7 +2153,13 @@ class BasePlatformAdapter(ABC):
         callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata: Dict[str, Any] = {}
+        if event.source.thread_id:
+            _thread_metadata["thread_id"] = event.source.thread_id
+        if getattr(event, "message_id", None):
+            _thread_metadata["message_id"] = event.message_id
+        if event.source.user_id:
+            _thread_metadata["user_id"] = event.source.user_id
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -2410,7 +2416,13 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                _thread_metadata: Dict[str, Any] = {}
+                if event.source.thread_id:
+                    _thread_metadata["thread_id"] = event.source.thread_id
+                if getattr(event, "message_id", None):
+                    _thread_metadata["message_id"] = event.message_id
+                if event.source.user_id:
+                    _thread_metadata["user_id"] = event.source.user_id
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(

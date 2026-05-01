@@ -120,6 +120,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
+        # Rate-limited logging for assistant_threads_setStatus failures.
+        # _setStatus_warned: chat_ids that have already had a WARNING logged.
+        self._setStatus_warned: set = set()
+        # _setStatus_no_scope: chat_ids that permanently lack the
+        # assistant:write scope (missing_scope/invalid_auth/not_authed).
+        # Once added, further calls are silently suppressed.
+        self._setStatus_no_scope: set = set()
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -429,16 +436,29 @@ class SlackAdapter(BasePlatformAdapter):
         Displays "is thinking..." next to the bot name in a thread.
         Requires the assistant:write or chat:write scope.
         Auto-clears when the bot sends a reply to the thread.
+
+        Falls back to ``message_id`` when ``thread_id``/``thread_ts`` is
+        absent so the indicator also works in DMs and channels that don't
+        have a thread parent.
         """
         if not self._app and not self._primary_client:
             return
+        if metadata is None:
+            metadata = {}
 
-        thread_ts = None
-        if metadata:
-            thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
+        # Permanently suppressed — this chat_id lacks the required scope.
+        if chat_id in self._setStatus_no_scope:
+            return
+
+        # Resolve thread_ts: prefer thread_id/thread_ts, fall back to message_id.
+        thread_ts = (
+            metadata.get("thread_id")
+            or metadata.get("thread_ts")
+            or metadata.get("message_id")
+        )
 
         if not thread_ts:
-            return  # Can only set status in a thread context
+            return  # Nothing to anchor the status indicator to.
 
         self._active_status_threads[chat_id] = thread_ts
         try:
@@ -447,10 +467,40 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts=thread_ts,
                 status="is thinking...",
             )
+            # Success — remove from warned set so future failures re-log.
+            self._setStatus_warned.discard(chat_id)
         except Exception as e:
-            # Silently ignore — may lack assistant:write scope or not be
-            # in an assistant-enabled context. Falls back to reactions.
-            logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
+            error_str = str(e)
+            # Permanently suppress auth/scope errors after first INFO log.
+            is_scope_error = any(
+                marker in error_str
+                for marker in ("missing_scope", "invalid_auth", "not_authed")
+            )
+            if is_scope_error:
+                if chat_id not in self._setStatus_no_scope:
+                    self._setStatus_no_scope.add(chat_id)
+                    logger.info(
+                        "[Slack] assistant.threads.setStatus missing scope for %s — "
+                        "suppressing further attempts: %s",
+                        chat_id,
+                        e,
+                    )
+                return
+
+            # Rate-limited logging: WARNING once per chat_id, then DEBUG.
+            if chat_id not in self._setStatus_warned:
+                self._setStatus_warned.add(chat_id)
+                logger.warning(
+                    "[Slack] assistant.threads.setStatus failed for %s: %s",
+                    chat_id,
+                    e,
+                )
+            else:
+                logger.debug(
+                    "[Slack] assistant.threads.setStatus failed for %s: %s",
+                    chat_id,
+                    e,
+                )
 
     async def stop_typing(self, chat_id: str) -> None:
         """Clear the assistant thread status indicator."""
@@ -465,8 +515,37 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts=thread_ts,
                 status="",
             )
+            # Success — clear warned state for this chat_id.
+            self._setStatus_warned.discard(chat_id)
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
+            error_str = str(e)
+            is_scope_error = any(
+                marker in error_str
+                for marker in ("missing_scope", "invalid_auth", "not_authed")
+            )
+            if is_scope_error:
+                if chat_id not in self._setStatus_no_scope:
+                    self._setStatus_no_scope.add(chat_id)
+                    logger.info(
+                        "[Slack] assistant.threads.setStatus clear missing scope for %s: %s",
+                        chat_id,
+                        e,
+                    )
+                return
+
+            if chat_id not in self._setStatus_warned:
+                self._setStatus_warned.add(chat_id)
+                logger.warning(
+                    "[Slack] assistant.threads.setStatus clear failed for %s: %s",
+                    chat_id,
+                    e,
+                )
+            else:
+                logger.debug(
+                    "[Slack] assistant.threads.setStatus clear failed for %s: %s",
+                    chat_id,
+                    e,
+                )
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
