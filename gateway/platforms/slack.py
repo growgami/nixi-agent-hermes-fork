@@ -134,8 +134,8 @@ class SlackAdapter(BasePlatformAdapter):
         # edit targeting when streaming fails mid-stream.
         self._active_stream_ts: Dict[str, str] = {}
         # chat_ids where streaming failed due to missing scope/auth.
-        # Persisted for the process lifetime — won't self-heal; workspace
-        # admin must restart the agent process after fixing the scope (S-NEW-3).
+        # Persists for adapter lifetime (process lifetime). Won't self-heal;
+        # agent process must be restarted after scope fix (S-NEW-3).
         self._streaming_disabled: set = set()
 
     async def connect(self) -> bool:

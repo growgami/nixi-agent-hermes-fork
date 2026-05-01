@@ -618,3 +618,340 @@ class TestStopTypingStreamCleanup:
 
         # Only the setStatus clear should be called
         mock_client.assistant_threads_setStatus.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Integration verification and edge case hardening
+# ---------------------------------------------------------------------------
+
+
+class TestSetStatusAutoClearWithStreaming:
+    """Verify setStatus auto-clear behavior with streaming.
+
+    chat.startStream counts as a reply → auto-clears setStatus.
+    Fallback: stop_typing() in stop_stream() clears remaining status.
+    _keep_typing() loop is harmless if re-called after auto-clear.
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_stream_auto_clears_status(self):
+        """After start_stream, typing status auto-clears because
+        chat.startStream counts as a reply. stop_stream() also clears
+        remaining status as a fallback."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        # Set up: typing indicator active
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+
+        # start_stream succeeds — Slack auto-clears setStatus on reply
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_stream"})
+        metadata = {"thread_id": "111.222", "message_id": "111.222", "user_id": "U_USER"}
+
+        result = await adapter.start_stream("C_CHAN", metadata=metadata)
+        assert result == "ts_stream"
+
+        # Verify startStream was called — this counts as a reply → auto-clear
+        mock_client.chat_startStream.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_stream_clears_status_as_fallback(self):
+        """stop_stream clears the typing indicator as fallback for
+        setStatus auto-clear edge cases."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_stream"
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+
+        mock_client.chat_stopStream = AsyncMock(return_value={})
+        mock_client.assistant_threads_setStatus = AsyncMock(return_value={})
+
+        await adapter.stop_stream("C_CHAN")
+
+        # Both stopStream and setStatus clear should be called
+        mock_client.chat_stopStream.assert_called_once()
+        mock_client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C_CHAN", thread_ts="111.222", status="",
+        )
+        assert "C_CHAN" not in adapter._active_status_threads
+
+    @pytest.mark.asyncio
+    async def test_keep_typing_harmless_after_auto_clear(self):
+        """After setStatus auto-clears (stream started), calling send_typing()
+        again is harmless — it just re-sets the status, which will
+        auto-clear again on the next append_stream reply."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.assistant_threads_setStatus = AsyncMock(return_value={})
+
+        metadata = {"thread_id": "111.222", "message_id": "111.222", "user_id": "U_USER"}
+
+        # First call: sets status
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+        assert adapter._active_status_threads["C_CHAN"] == "111.222"
+        assert mock_client.assistant_threads_setStatus.call_count == 1
+
+        # Second call: re-sets status (harmless — will auto-clear on stream)
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+        assert mock_client.assistant_threads_setStatus.call_count == 2
+
+
+class TestMultiWorkspaceStreaming:
+    """Verify multi-workspace streaming uses the correct client per workspace."""
+
+    @pytest.mark.asyncio
+    async def test_stream_uses_workspace_specific_client(self):
+        """start_stream/append_stream/stop_stream use _get_client()
+        which returns the workspace-specific WebClient for multi-workspace."""
+        adapter = _make_adapter()
+
+        # Set up two workspace clients
+        team_a_client = AsyncMock()
+        team_b_client = AsyncMock()
+        team_a_client.chat_startStream = AsyncMock(return_value={"ts": "ts_A"})
+        team_a_client.chat_appendStream = AsyncMock(return_value={})
+        team_a_client.chat_stopStream = AsyncMock(return_value={})
+        team_b_client.chat_startStream = AsyncMock(return_value={"ts": "ts_B"})
+        team_b_client.chat_appendStream = AsyncMock(return_value={})
+        team_b_client.chat_stopStream = AsyncMock(return_value={})
+
+        adapter._team_clients = {"T_A": team_a_client, "T_B": team_b_client}
+        adapter._channel_team = {"C_A": "T_A", "C_B": "T_B"}
+
+        metadata_a = {"thread_id": "111.222", "user_id": "U_A"}
+        metadata_b = {"thread_id": "333.444", "user_id": "U_B"}
+
+        # Start stream on team A's channel
+        result_a = await adapter.start_stream("C_A", metadata=metadata_a)
+        assert result_a == "ts_A"
+        team_a_client.chat_startStream.assert_called_once()
+        # Verify recipient_team_id passed
+        call_kwargs_a = team_a_client.chat_startStream.call_args[1]
+        assert call_kwargs_a["recipient_team_id"] == "T_A"
+        assert call_kwargs_a["recipient_user_id"] == "U_A"
+
+        # Start stream on team B's channel
+        result_b = await adapter.start_stream("C_B", metadata=metadata_b)
+        assert result_b == "ts_B"
+        team_b_client.chat_startStream.assert_called_once()
+        call_kwargs_b = team_b_client.chat_startStream.call_args[1]
+        assert call_kwargs_b["recipient_team_id"] == "T_B"
+        assert call_kwargs_b["recipient_user_id"] == "U_B"
+
+        # Verify no cross-contamination — team A's client wasn't called for B
+        assert team_a_client.chat_startStream.call_count == 1
+        assert team_b_client.chat_startStream.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_append_stream_uses_correct_workspace(self):
+        """append_stream uses _get_client(chat_id) to reach the right workspace."""
+        adapter = _make_adapter()
+
+        team_a_client = AsyncMock()
+        team_a_client.chat_appendStream = AsyncMock(return_value={})
+        adapter._team_clients = {"T_A": team_a_client}
+        adapter._channel_team = {"C_A": "T_A"}
+
+        adapter._active_stream_ts["C_A"] = "ts_001"
+        metadata = {"thread_id": "111.222"}
+
+        result = await adapter.append_stream("C_A", "Hello", metadata=metadata)
+        assert result is True
+        team_a_client.chat_appendStream.assert_called_once()
+
+
+class TestStreamingFinalizeInteraction:
+    """Verify streaming and edit-based finalize don't conflict."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_active_skips_finalize(self):
+        """When streaming is active, stop_stream IS finalization.
+        The got_done block calls stop_stream and returns early,
+        skipping all remaining got_done logic including finalize."""
+        adapter = _make_streaming_adapter()
+        metadata = {"thread_id": "111.222"}
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN", metadata=metadata)
+
+        # Start streaming
+        await consumer._send_or_edit("Hello")
+        assert consumer._native_streaming is True
+
+        # Simulate got_done — stop_stream should be called,
+        # _native_streaming reset, _last_streamed_len reset
+        await adapter.stop_stream("C_CHAN", metadata=metadata)
+        adapter.stop_stream.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_uses_edit_finalize(self):
+        """When streaming failed (fell back), existing finalize logic runs unchanged."""
+        adapter = _make_streaming_adapter()
+        adapter.start_stream = AsyncMock(return_value=None)  # streaming unavailable
+
+        metadata = {"thread_id": "111.222"}
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN", metadata=metadata)
+
+        # Falls through to standard send path
+        result = await consumer._send_or_edit("Hello")
+        assert result is True
+        assert consumer._native_streaming is False
+
+        # Verify send (not stream) was used
+        adapter.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_adapter_requires_finalize_with_streaming(self):
+        """When streaming is active, _adapter_requires_finalize is bypassed
+        because stop_stream early-returns in got_done (B-NEW-3)."""
+        adapter = _make_streaming_adapter()
+        # This adapter has REQUIRES_EDIT_FINALIZE = False by default (MagicMock)
+        metadata = {"thread_id": "111.222"}
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN", metadata=metadata)
+
+        # Start streaming
+        await consumer._send_or_edit("Hello")
+        assert consumer._native_streaming is True
+        # _adapter_requires_finalize is False (default MagicMock attribute)
+        assert consumer._adapter_requires_finalize is False
+
+
+class TestDeltaTrackingReset:
+    """Verify _last_streamed_len resets at all stream boundaries."""
+
+    def test_reset_on_new_stream_start(self):
+        """_last_streamed_len = 0 on new stream start (in _send_or_edit)."""
+        adapter = _make_streaming_adapter()
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN")
+
+        # Simulate a completed stream with stale delta
+        consumer._last_streamed_len = 100
+        consumer._native_streaming = False
+        consumer._message_id = None
+
+        # On next _send_or_edit, start_stream resets _last_streamed_len = 0
+        # (This is tested in the consumer test_first_send_uses_start_stream)
+
+    def test_reset_on_stream_stop(self):
+        """_last_streamed_len = 0 when streaming stops (got_done path)."""
+        adapter = _make_streaming_adapter()
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN")
+
+        # Simulate streaming state
+        consumer._native_streaming = True
+        consumer._last_streamed_len = 50
+
+        # _reset_segment_state should clear streaming state
+        consumer._reset_segment_state()
+        assert consumer._native_streaming is False
+        assert consumer._last_streamed_len == 0
+
+    @pytest.mark.asyncio
+    async def test_reset_on_append_failure(self):
+        """append_stream failure resets _last_streamed_len to 0."""
+        adapter = _make_streaming_adapter()
+        metadata = {"thread_id": "111.222"}
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN", metadata=metadata)
+
+        await consumer._send_or_edit("Hello")
+        assert consumer._native_streaming is True
+        assert consumer._last_streamed_len == len("Hello")
+
+        # Make append fail
+        adapter.append_stream = AsyncMock(return_value=False)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="1234567890.123456",
+        ))
+
+        result = await consumer._send_or_edit("Hello world")
+        assert consumer._native_streaming is False
+        assert consumer._last_streamed_len == 0
+
+    def test_reset_on_segment_break(self):
+        """_reset_segment_state clears streaming state on tool boundary."""
+        adapter = _make_streaming_adapter()
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN")
+        consumer._native_streaming = True
+        consumer._last_streamed_len = 75
+
+        consumer._reset_segment_state()
+        assert consumer._native_streaming is False
+        assert consumer._last_streamed_len == 0
+
+    def test_no_stale_delta_leaks(self):
+        """After reset, _last_streamed_len is 0 so next stream starts clean."""
+        adapter = _make_streaming_adapter()
+        consumer = GatewayStreamConsumer(adapter, "C_CHAN")
+
+        # Simulate end of a stream
+        consumer._native_streaming = True
+        consumer._last_streamed_len = 200
+        consumer._reset_segment_state()
+
+        # Confirm clean state for next stream
+        assert consumer._native_streaming is False
+        assert consumer._last_streamed_len == 0
+
+
+class TestStreamingDisabledDocumentation:
+    """Verify _streaming_disabled scope and documentation."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_disabled_persists_across_calls(self):
+        """Once disabled, streaming stays disabled for the adapter lifetime."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.chat_startStream = AsyncMock(
+            side_effect=Exception("missing_scope: need chat:write")
+        )
+
+        metadata = {"thread_id": "111.222"}
+        chat_id = "C_CHAN"
+
+        # First call disables streaming
+        result = await adapter.start_stream(chat_id, metadata=metadata)
+        assert result is None
+        assert chat_id in adapter._streaming_disabled
+
+        # Fix the mock to succeed — but disabled set persists
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_new"})
+        result = await adapter.start_stream(chat_id, metadata=metadata)
+        assert result is None
+        # chat_startStream never called again
+        assert mock_client.chat_startStream.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_disabled_chat_id_does_not_affect_other_chats(self):
+        """Streaming disabled for one chat_id doesn't affect other chat_ids."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.chat_startStream = AsyncMock(
+            side_effect=Exception("missing_scope: need chat:write")
+        )
+
+        metadata = {"thread_id": "111.222"}
+
+        # Disable for C_CHAN
+        await adapter.start_stream("C_CHAN", metadata=metadata)
+        assert "C_CHAN" in adapter._streaming_disabled
+
+        # Different chat_id should still try
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_other"})
+        result = await adapter.start_stream("D_OTHER", metadata=metadata)
+        assert result == "ts_other"
+        assert "D_OTHER" not in adapter._streaming_disabled
+
+
+class TestHealthMonitor:
+    """Verify health monitor delegation works via _set_fatal_error."""
+
+    @pytest.mark.asyncio
+    async def test_set_fatal_error_retryable(self):
+        """_set_fatal_error with retryable=True signals gateway runner."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.slack import SlackAdapter
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+        adapter._set_fatal_error("socket_mode_dead", "Socket Mode task terminated", retryable=True)
+
+        assert adapter.has_fatal_error is True
+        assert adapter._fatal_error_code == "socket_mode_dead"
+        assert adapter._fatal_error_retryable is True

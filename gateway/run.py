@@ -9586,7 +9586,14 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_metadata: Dict[str, Any] = {}
+        if _progress_thread_id:
+            _progress_metadata["thread_id"] = _progress_thread_id
+        if source.message_id:
+            _progress_metadata["message_id"] = source.message_id
+        if source.user_id:
+            _progress_metadata["user_id"] = source.user_id
+        _progress_metadata = _progress_metadata if _progress_metadata else None
 
         async def send_progress_messages():
             if not progress_queue:
