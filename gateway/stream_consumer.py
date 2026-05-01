@@ -16,6 +16,7 @@ Credit: jobless0x (#774, #1312), OutThisLife (#798), clicksingh (#697).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import re
@@ -114,6 +115,14 @@ class GatewayStreamConsumer:
         self._in_think_block = False
         self._think_buffer = ""
 
+        # Native streaming state (Slack chat.startStream/appendStream/stopStream).
+        # _native_streaming is a boolean flag (S-2), not per-chat_id — there's
+        # only one active stream per consumer instance.
+        self._native_streaming: bool = False
+        # Characters already sent via appendStream. Used to compute deltas
+        # so we only send new text, not the full accumulated buffer.
+        self._last_streamed_len: int = 0
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -151,6 +160,9 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        # Reset native streaming state for the new segment
+        self._native_streaming = False
+        self._last_streamed_len = 0
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -393,6 +405,19 @@ class GatewayStreamConsumer:
                     self._last_edit_time = time.monotonic()
 
                 if got_done:
+                    # ── Slack native streaming finalization (B-NEW-3) ──────────
+                    # If we were streaming via chat.startStream, call
+                    # chat.stopStream and skip ALL remaining got_done logic.
+                    # The streaming message was already finalized by the API.
+                    if self._native_streaming:
+                        await self.adapter.stop_stream(
+                            self.chat_id, metadata=self.metadata,
+                        )
+                        self._native_streaming = False
+                        self._last_streamed_len = 0
+                        self._final_response_sent = True
+                        return  # Skip ALL remaining got_done logic (B-NEW-3)
+
                     # Final edit without cursor. If progressive editing failed
                     # mid-stream, send a single continuation/fallback message
                     # here instead of letting the base gateway path send the
@@ -461,6 +486,12 @@ class GatewayStreamConsumer:
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
+            # If streaming was active, stop it before cleanup
+            if self._native_streaming:
+                try:
+                    await self.adapter.stop_stream(self.chat_id, metadata=self.metadata)
+                except Exception:
+                    pass
             # Best-effort final edit on cancellation
             _best_effort_ok = False
             if self._fallback_send_done:
@@ -766,6 +797,69 @@ class GatewayStreamConsumer:
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
         text = self._clean_for_display(text)
+
+        # ── Slack native streaming dispatch ──────────────────────────────────
+        # If the platform supports chat.startStream/appendStream/stopStream
+        # (currently Slack only), use it for real-time streaming instead of
+        # the edit-based approach.  Delta text is sent raw — format_message()
+        # is NOT applied (S5).  _clean_for_display() was already applied
+        # above (S-NEW-2).
+        # Use inspect.iscoroutinefunction to distinguish real async methods
+        # from MagicMock auto-attributes (which are sync mocks).
+        _adapter_start_stream = getattr(self.adapter, 'start_stream', None)
+        adapter_has_streaming = (
+            _adapter_start_stream is not None
+            and inspect.iscoroutinefunction(_adapter_start_stream)
+        )
+
+        if adapter_has_streaming and self._native_streaming:
+            # Subsequent sends — compute and send only the delta (S-1)
+            delta = text[self._last_streamed_len:]
+            if delta:
+                ok = await self.adapter.append_stream(
+                    self.chat_id, delta, metadata=self.metadata,
+                )
+                if ok:
+                    self._last_streamed_len = len(text)
+                    return True  # skip edit — stream handled this tick
+                else:
+                    # append_stream failed → exit streaming, fall through to
+                    # edit path.  _message_id is already set from start_stream
+                    # so the edit targets the streaming message (B-NEW-1).
+                    self._native_streaming = False
+                    self._last_streamed_len = 0
+                    # Fall through to edit path below
+            else:
+                # No new content since last append — skip this tick
+                return True
+
+        if adapter_has_streaming and not self._native_streaming and self._message_id is None:
+            # First send — attempt to start a native stream
+            message_ts = await self.adapter.start_stream(
+                self.chat_id, metadata=self.metadata,
+            )
+            if message_ts:
+                # Streaming started successfully (S-2)
+                self._native_streaming = True
+                self._message_id = message_ts  # B-NEW-2
+                self._already_sent = True  # stream counts as delivery
+                self._last_streamed_len = 0  # S-1 reset delta tracker
+                # Send the initial text as the first append
+                if text.strip():
+                    ok = await self.adapter.append_stream(
+                        self.chat_id, text, metadata=self.metadata,
+                    )
+                    if ok:
+                        self._last_streamed_len = len(text)
+                    else:
+                        # append failed on first call → exit streaming
+                        self._native_streaming = False
+                        self._last_streamed_len = 0
+                        # Fall through to regular send path — _message_id
+                        # is set so next calls will use edit
+                return True
+
+        # ── Standard edit-based streaming path ───────────────────────────────
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text

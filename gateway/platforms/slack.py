@@ -129,6 +129,14 @@ class SlackAdapter(BasePlatformAdapter):
         # assistant:write scope (missing_scope/invalid_auth/not_authed).
         # Once added, further calls are silently suppressed.
         self._setStatus_no_scope: set = set()
+        # Streaming state: maps chat_id → message ts from chat.startStream.
+        # Used for chat_appendStream / chat_stopStream calls AND for fallback
+        # edit targeting when streaming fails mid-stream.
+        self._active_stream_ts: Dict[str, str] = {}
+        # chat_ids where streaming failed due to missing scope/auth.
+        # Persisted for the process lifetime — won't self-heal; workspace
+        # admin must restart the agent process after fixing the scope (S-NEW-3).
+        self._streaming_disabled: set = set()
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -572,9 +580,16 @@ class SlackAdapter(BasePlatformAdapter):
                 )
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Clear the assistant thread status indicator."""
+        """Clear the assistant thread status indicator.
+
+        Also stops any active native stream for this chat_id, since
+        the setStatus auto-clear edge case can leave streams dangling.
+        """
         if not self._app and not self._primary_client:
             return
+        # Stop active stream if one exists (cleanup for setStatus auto-clear)
+        if chat_id in self._active_stream_ts:
+            await self.stop_stream(chat_id)
         thread_ts = self._active_status_threads.pop(chat_id, None)
         if not thread_ts:
             return
@@ -615,6 +630,146 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_id,
                     e,
                 )
+
+    async def start_stream(self, chat_id: str, metadata=None) -> Optional[str]:
+        """Start a native Slack streaming session via chat.startStream.
+
+        Returns the message ts from the startStream response on success,
+        or None if streaming is unavailable/disabled for this chat_id.
+
+        The ts is stored in _active_stream_ts for subsequent
+        chat_appendStream / chat_stopStream calls and for fallback edit
+        targeting if streaming fails mid-stream.
+        """
+        if not self._app and not self._primary_client:
+            return None
+        # Permanently disabled for this chat_id (scope/auth error)
+        if chat_id in self._streaming_disabled:
+            return None
+        # Close any existing stream for this chat_id (B3 concurrent session)
+        if chat_id in self._active_stream_ts:
+            await self.stop_stream(chat_id, metadata=metadata)
+
+        thread_ts = (
+            (metadata or {}).get("thread_id")
+            or (metadata or {}).get("message_id")
+        )
+        if not thread_ts:
+            logger.debug("[Slack] start_stream: no thread_ts resolvable for %s", chat_id)
+            return None  # B1 — can't start stream without thread anchor
+
+        recipient_team_id = self._channel_team.get(chat_id)
+        recipient_user_id = (metadata or {}).get("user_id") if metadata else None
+
+        try:
+            kwargs = {
+                "channel": chat_id,
+                "thread_ts": thread_ts,
+            }
+            if recipient_team_id:
+                kwargs["recipient_team_id"] = recipient_team_id
+            if recipient_user_id:
+                kwargs["recipient_user_id"] = recipient_user_id
+
+            response = await self._get_client(chat_id).chat_startStream(**kwargs)
+            message_ts = response.get("ts")
+            if message_ts:
+                self._active_stream_ts[chat_id] = message_ts
+                logger.debug("[Slack] start_stream: streaming started for %s (ts=%s)", chat_id, message_ts)
+                return message_ts
+            logger.warning("[Slack] start_stream: response missing ts for %s", chat_id)
+            return None
+        except Exception as e:
+            error_str = str(e)
+            is_scope_error = any(
+                marker in error_str
+                for marker in ("missing_scope", "invalid_auth", "not_authed")
+            )
+            if is_scope_error:
+                self._streaming_disabled.add(chat_id)
+                logger.info(
+                    "[Slack] start_stream: streaming permanently disabled for %s — "
+                    "process restart required after scope fix: %s",
+                    chat_id, e,
+                )
+            else:
+                logger.warning("[Slack] start_stream failed for %s: %s", chat_id, e)
+            return None
+
+    async def append_stream(self, chat_id: str, text: str, metadata=None) -> bool:
+        """Append incremental text to an active Slack streaming message.
+
+        Sends only the delta (new text since last append) via
+        chat_appendStream.  Returns True on success, False on failure
+        (which triggers fallback to edit-based streaming in the consumer).
+
+        The text parameter should be the raw delta text (not accumulated),
+        already cleaned by _clean_for_display upstream (S-NEW-2).  No
+        format_message() is applied here (S5).
+        """
+        message_ts = self._active_stream_ts.get(chat_id)
+        if not message_ts:
+            return False
+
+        thread_ts = (
+            (metadata or {}).get("thread_id")
+            or (metadata or {}).get("message_id")
+        )
+
+        try:
+            kwargs = {
+                "channel": chat_id,
+                "ts": message_ts,
+                "markdown_text": text,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            await self._get_client(chat_id).chat_appendStream(**kwargs)
+            return True
+        except Exception as e:
+            logger.warning("[Slack] append_stream failed for %s: %s", chat_id, e)
+            # Remove from active streams — consumer will fall through to edit
+            self._active_stream_ts.pop(chat_id, None)
+            return False
+
+    async def stop_stream(self, chat_id: str, metadata=None) -> bool:
+        """Stop an active Slack streaming session via chat.stopStream.
+
+        Returns True on success, False on failure or if no active stream.
+        Also clears the typing indicator if one was active.
+        """
+        message_ts = self._active_stream_ts.pop(chat_id, None)
+        if not message_ts:
+            return False
+
+        try:
+            await self._get_client(chat_id).chat_stopStream(
+                channel=chat_id, ts=message_ts,
+            )
+            logger.debug("[Slack] stop_stream: streaming stopped for %s", chat_id)
+            result = True
+        except Exception as e:
+            logger.warning("[Slack] stop_stream failed for %s: %s", chat_id, e)
+            result = False
+
+        # Clear typing indicator if one was active for this chat_id.
+        # Use the same setStatus="" clear logic as stop_typing(), but call
+        # it directly rather than routing through stop_typing() to avoid
+        # re-entry — stop_typing() calls stop_stream(), so a full call
+        # would create infinite recursion.
+        thread_ts = self._active_status_threads.pop(chat_id, None)
+        if thread_ts:
+            try:
+                await self._get_client(chat_id).assistant_threads_setStatus(
+                    channel_id=chat_id,
+                    thread_ts=thread_ts,
+                    status="",
+                )
+            except Exception:
+                pass  # best-effort — don't let setStatus failure block stream stop
+
+        return result
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
