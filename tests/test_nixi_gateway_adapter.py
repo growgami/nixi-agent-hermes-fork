@@ -809,3 +809,293 @@ class TestDeduplication:
 
             assert len(called_events) == 1
             assert called_events[0].message_id == "1234567890.654321"
+
+
+# ─── Intent classifier integration tests ───────────────────────────────────
+
+
+class TestIntentClassifierIntegration:
+    """Integration tests verifying the full classification flow from
+    _dispatch_event through to the correct action (DROP/RESPOND/PASS).
+
+    Unlike the other test classes that mock classify() to always PASS,
+    these tests exercise the REAL classify() function through the dispatch
+    path, verifying end-to-end behavior of the classifier + adapter.
+    """
+
+    BOT_USER_ID = "UBOT99999"  # Slack user IDs are uppercase — matches _MENTION_RE
+    NOHELLO_URL = "https://nohello.net"
+
+    def _make_dm_event(self, text: str, channel: str = "D12345", **extra_fields) -> dict:
+        """Build a DM event payload."""
+        event = {
+            "text": text,
+            "channel": channel,
+            "channel_type": "im",
+            "event_ts": "1700000000.000001",
+        }
+        event.update(extra_fields)
+        return {"event": event}
+
+    def _make_channel_event(self, text: str, channel: str = "C99999", **extra_fields) -> dict:
+        """Build a channel message event payload."""
+        event = {
+            "text": text,
+            "channel": channel,
+            "event_ts": "1700000000.000002",
+        }
+        event.update(extra_fields)
+        return {"event": event}
+
+    @pytest.mark.asyncio
+    async def test_dm_greeting_sends_nohello_url(self, nixi_adapter):
+        """DM greeting → classify returns RESPOND → self.send() called with nohello.net URL on DM channel."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_dm_event("hey"),
+            user_id="U_USER1",
+            user_name="TestUser",
+        )
+
+        # RESPOND path: send() called with DM channel ID, no background task
+        nixi_adapter.send.assert_called_once()
+        call_args = nixi_adapter.send.call_args
+        # First positional arg is chat_id — must be the DM channel ID (D-prefix)
+        assert call_args[0][0].startswith("D")
+        assert call_args[0][0] == "D12345"
+        # Second arg is response text — must be nohello.net URL
+        assert call_args[0][1] == self.NOHELLO_URL
+        # No background task created (no message_handler call)
+        await asyncio.sleep(0.05)
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_greeting_responds(self, nixi_adapter):
+        """Channel "@bot hey" → RESPOND path fires with correct chat_id."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event(f"<@{self.BOT_USER_ID}> hey"),
+            user_id="U_USER2",
+            user_name="TestUser2",
+        )
+
+        # RESPOND: send() called on the channel ID
+        nixi_adapter.send.assert_called_once()
+        assert nixi_adapter.send.call_args[0][0] == "C99999"
+        assert nixi_adapter.send.call_args[0][1] == self.NOHELLO_URL
+        # No background task
+        await asyncio.sleep(0.05)
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_substantive_passes(self, nixi_adapter):
+        """Channel "@bot summarize the thread" → PASS (background task + handle_message)."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            # Return None — no agent response to send back
+            return None
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event(f"<@{self.BOT_USER_ID}> summarize the thread"),
+                user_id="U_USER3",
+                user_name="TestUser3",
+            )
+
+        # PASS: background task created, handle_message eventually called
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        assert called_events[0].text == f"<@{self.BOT_USER_ID}> summarize the thread"
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_acknowledgment_drops(self, nixi_adapter):
+        """Channel "@bot thanks!" → DROP (no send, no background task)."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event(f"<@{self.BOT_USER_ID}> thanks!"),
+            user_id="U_USER4",
+            user_name="TestUser4",
+        )
+
+        # DROP: no send, no background task
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_thread_continuation_passes(self, nixi_adapter):
+        """Thread msg (bot mentioned earlier) → PASS via thread_continuation_rule."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        # Simulate prior bot engagement in this thread
+        thread_ts = "1600000000.111111"
+        nixi_adapter._mention_cache.record(thread_ts)
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event(
+                    "following up on that",
+                    thread_ts=thread_ts,
+                ),
+                user_id="U_USER5",
+                user_name="TestUser5",
+            )
+
+        # PASS via thread continuation
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        assert called_events[0].source.thread_id == thread_ts
+
+    @pytest.mark.asyncio
+    async def test_unrelated_channel_message_drops(self, nixi_adapter):
+        """Unrelated channel message (no mention, no thread) → DROP."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event("just chatting about work stuff"),
+            user_id="U_USER6",
+            user_name="TestUser6",
+        )
+
+        # DROP: no send, no background task
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_thread_mention_cache_records_and_returns(self, nixi_adapter):
+        """ThreadMentionCache records bot mention AND PASS thread messages,
+        returns correct had_bot on subsequent messages in same thread."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        cache = nixi_adapter._mention_cache
+        thread_ts = "1600000000.222222"
+
+        # Initially, no record of bot engagement
+        assert cache.had_bot(thread_ts) is False
+
+        # Record bot mention (simulating a @bot mention in thread)
+        cache.record(thread_ts)
+        assert cache.had_bot(thread_ts) is True
+
+        # New thread with no bot mention — record via PASS path
+        # (In the adapter, record() is called when bot_mentioned or action=="pass" in thread)
+        other_thread = "1600000000.333333"
+        assert cache.had_bot(other_thread) is False
+
+        # Simulate what the adapter does on PASS: record the thread
+        cache.record(other_thread)
+        assert cache.had_bot(other_thread) is True
+
+    @pytest.mark.asyncio
+    async def test_subtype_message_changed_drops(self, nixi_adapter):
+        """Event with subtype="message_changed" → DROP before classifier."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            {
+                "event": {
+                    "text": "<@Ubot99999> hey",
+                    "channel": "C99999",
+                    "subtype": "message_changed",
+                    "event_ts": "1700000000.000003",
+                }
+            },
+            user_id="U_USER7",
+            user_name="TestUser7",
+        )
+
+        # Subtype filter blocks before classifier — no send, no background task
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_bot_user_id_no_false_positives(self, nixi_adapter):
+        """Empty NIXI_BOT_USER_ID → bot_mentioned=False for all messages (conservative)."""
+        # Set empty bot_user_id
+        nixi_adapter._bot_user_id = ""
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        # A message that WOULD be a mention if bot_user_id was set
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event("<@Ubot99999> hey"),
+            user_id="U_USER8",
+            user_name="TestUser8",
+        )
+
+        # With empty bot_user_id, the mention detection returns False.
+        # The mention rules skip, and the unrelated_drop_rule fires → DROP
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
