@@ -45,6 +45,7 @@ from nixi.intent_classifier import (
     ClassificationResult,
     ThreadMentionCache,
     bot_mentioned_in_text,
+    bot_name_mentioned,
     classify,
 )
 
@@ -138,6 +139,32 @@ class NixiAdapter(BasePlatformAdapter):
             logger.warning(
                 "[nixi] NIXI_BOT_USER_ID not set — classifier will not detect channel mentions"
             )
+
+        # Bot names for natural-language mention detection (e.g. "nixi", "fixi").
+        # Env var override takes precedence (JSON list string), then config extra,
+        # then default. "nixi" is always included as a baseline.
+        _bot_names_env = os.getenv("NIXI_BOT_NAMES", "")
+        if _bot_names_env:
+            try:
+                _parsed = json.loads(_bot_names_env)
+                if isinstance(_parsed, list):
+                    _bot_names_set = set(_parsed)
+                else:
+                    logger.warning(
+                        "[nixi] NIXI_BOT_NAMES env var is not a JSON list, falling back to config"
+                    )
+                    _bot_names_set = set(extra.get("bot_names", ["nixi"]))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "[nixi] NIXI_BOT_NAMES env var is not valid JSON, falling back to config"
+                )
+                _bot_names_set = set(extra.get("bot_names", ["nixi"]))
+        else:
+            _bot_names_set = set(extra.get("bot_names", ["nixi"]))
+
+        _bot_names_set.add("nixi")  # Always include baseline name
+        self._bot_names: tuple[str, ...] = tuple(sorted(_bot_names_set))
+        logger.info("[nixi] Bot names for classifier: %s", self._bot_names)
 
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -391,6 +418,8 @@ class NixiAdapter(BasePlatformAdapter):
 
         # Determine bot mention status
         bot_mentioned = bot_mentioned_in_text(text, self._bot_user_id)
+        bot_name_detected = bot_name_mentioned(text, self._bot_names)
+        bot_invoked = bot_mentioned or bot_name_detected
 
         # Determine thread-continuation status from cache
         thread_had_bot = (
@@ -404,6 +433,16 @@ class NixiAdapter(BasePlatformAdapter):
             thread_ts=thread_ts,
             bot_user_id=self._bot_user_id or None,
             thread_had_bot=thread_had_bot,
+            bot_names=self._bot_names,
+        )
+
+        logger.debug(
+            "[nixi] Message receipt: user=%s channel=%s text_len=%d bot_mentioned=%s bot_name_detected=%s",
+            user_id,
+            channel,
+            len(text),
+            bot_mentioned,
+            bot_name_detected,
         )
         result = classify(ctx)
 
@@ -420,7 +459,7 @@ class NixiAdapter(BasePlatformAdapter):
         # mentioned, or (b) classified as PASS for a thread message (nixi
         # will respond in this thread, making bot "present" for future
         # continuation detection).
-        if thread_ts and (bot_mentioned or result.action == "pass"):
+        if thread_ts and (bot_invoked or result.action == "pass"):
             self._mention_cache.record(thread_ts)
 
         if result.action == "drop":

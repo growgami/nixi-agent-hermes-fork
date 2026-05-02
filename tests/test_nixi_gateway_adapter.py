@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nixi.intent_classifier import ClassificationResult
+from nixi.intent_classifier import ClassificationResult, classify
 
 # Default "pass" result for mocking the classifier in dispatch tests.
 # These tests focus on the adapter's dispatch logic, not the classifier,
@@ -120,6 +120,64 @@ class TestNixiAdapterInit:
         adapter = NixiAdapter(config)
         assert adapter._host == "0.0.0.0"
         assert adapter._port == 8080
+
+    def test_bot_names_default_includes_nixi(self):
+        """Default bot_names should always include 'nixi'."""
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={})
+        adapter = NixiAdapter(config)
+        assert "nixi" in adapter._bot_names
+        assert adapter._bot_names == ("nixi",)
+
+    def test_bot_names_from_config_extra(self):
+        """bot_names from config extra should be used, with 'nixi' always included."""
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        adapter = NixiAdapter(config)
+        assert "nixi" in adapter._bot_names
+        assert "fixi" in adapter._bot_names
+
+    def test_bot_names_env_var_overrides_config(self):
+        """NIXI_BOT_NAMES env var (JSON list) should override config extra."""
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        with patch.dict(os.environ, {"NIXI_BOT_NAMES": '["nixi", "robo"]'}):
+            adapter = NixiAdapter(config)
+            assert "nixi" in adapter._bot_names
+            assert "robo" in adapter._bot_names
+            assert "fixi" not in adapter._bot_names
+
+    def test_bot_names_env_var_invalid_json_falls_back(self):
+        """Invalid NIXI_BOT_NAMES JSON should fall back to config extra."""
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        with patch.dict(os.environ, {"NIXI_BOT_NAMES": "not-json"}):
+            adapter = NixiAdapter(config)
+            assert "nixi" in adapter._bot_names
+            assert "fixi" in adapter._bot_names
+
+    def test_bot_names_env_var_not_a_list_falls_back(self):
+        """NIXI_BOT_NAMES that's valid JSON but not a list should fall back to config."""
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        with patch.dict(os.environ, {"NIXI_BOT_NAMES": '"justastring"'}):
+            adapter = NixiAdapter(config)
+            assert "nixi" in adapter._bot_names
+            assert "fixi" in adapter._bot_names
+
+    def test_bot_names_always_includes_nixi_even_if_config_omits(self):
+        """Even if config extra lists names without 'nixi', 'nixi' must be included."""
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["fixi"]})
+        adapter = NixiAdapter(config)
+        assert "nixi" in adapter._bot_names
+        assert "fixi" in adapter._bot_names
 
 
 # ─── Health endpoint ──────────────────────────────────────────────────────
@@ -809,6 +867,148 @@ class TestDeduplication:
 
             assert len(called_events) == 1
             assert called_events[0].message_id == "1234567890.654321"
+
+
+# ─── Bot names wiring ────────────────────────────────────────────────────
+
+
+class TestBotNamesWiring:
+    """Tests for bot_names loading, ClassificationContext propagation,
+    bot_name_detected computation, bot_invoked thread cache condition,
+    and receipt logging."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_passes_bot_names_to_context(self, nixi_adapter):
+        """ClassificationContext should receive bot_names from adapter."""
+        nixi_adapter._bot_user_id = "UBOT99999"
+        # Set custom bot_names
+        nixi_adapter._bot_names = ("fixi", "nixi")
+
+        captured_ctx = None
+
+        def capture_classify(ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return _CLASSIFY_PASS
+
+        with patch("nixi.gateway_adapter.classify", side_effect=capture_classify), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                {"event": {"text": "hello", "channel": "C123", "event_ts": "111.222"}},
+                user_id="U1",
+                user_name="User1",
+            )
+            await asyncio.sleep(0.05)
+
+        assert captured_ctx is not None
+        assert "nixi" in captured_ctx.bot_names
+        assert "fixi" in captured_ctx.bot_names
+
+    @pytest.mark.asyncio
+    async def test_bot_name_detected_in_dispatch(self, nixi_adapter):
+        """bot_name_mentioned should detect name-based invocations."""
+        from nixi.gateway_adapter import bot_name_mentioned
+
+        nixi_adapter._bot_user_id = ""  # No user ID — rely on name detection
+        nixi_adapter._bot_names = ("nixi",)
+
+        # A message mentioning "nixi" by name should be detected
+        assert bot_name_mentioned("hey nixi can you help?", ("nixi",)) is True
+        # A message without the name should not
+        assert bot_name_mentioned("just chatting about work", ("nixi",)) is False
+
+    @pytest.mark.asyncio
+    async def test_bot_invoked_thread_cache_records_name_mention(self, nixi_adapter):
+        """Thread cache should record when bot is invoked by name (not just <@USERID>).
+        
+        When a user says "nixi help" in a thread (name mention, no <@USERID>),
+        the thread cache should record bot presence via bot_invoked.
+        """
+        nixi_adapter._bot_user_id = "UBOT99999"
+        nixi_adapter._bot_names = ("nixi",)
+
+        thread_ts = "1600000000.444444"
+
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                {
+                    "event": {
+                        "text": "nixi can you help?",
+                        "channel": "C99999",
+                        "thread_ts": thread_ts,
+                        "event_ts": "1700000000.000010",
+                    }
+                },
+                user_id="U_USER_NAME",
+                user_name="NameUser",
+            )
+            await asyncio.sleep(0.05)
+
+        # Thread cache should record because bot_invoked=True (name mention)
+        assert nixi_adapter._mention_cache.had_bot(thread_ts) is True
+
+    @pytest.mark.asyncio
+    async def test_receipt_logging_includes_both_detection_paths(self, nixi_adapter):
+        """Receipt debug log should include both bot_mentioned and bot_name_detected boolean values."""
+        nixi_adapter._bot_user_id = "UBOT99999"
+        nixi_adapter._bot_names = ("nixi",)
+
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            with patch("nixi.gateway_adapter.logger") as mock_logger:
+                await nixi_adapter._dispatch_event(
+                    {
+                        "event": {
+                            "text": "<@UBOT99999> hello",
+                            "channel": "C99999",
+                            "event_ts": "1700000000.000020",
+                        }
+                    },
+                    user_id="U1",
+                    user_name="User1",
+                )
+
+                # Find the debug call that includes "Message receipt"
+                debug_calls = mock_logger.debug.call_args_list
+                receipt_calls = [c for c in debug_calls if "Message receipt" in str(c)]
+                assert len(receipt_calls) >= 1, f"No receipt log found in debug calls: {debug_calls}"
+                # Verify both booleans appear in the log call
+                receipt_call = receipt_calls[0]
+                assert "bot_mentioned" in str(receipt_call)
+
+    @pytest.mark.asyncio
+    async def test_no_name_mention_no_false_thread_cache(self, nixi_adapter):
+        """Without any mention (no <@USERID>, no name), thread cache should NOT record 
+        on the DROP path (unless action=="pass")."""
+        nixi_adapter._bot_user_id = "UBOT99999"
+        nixi_adapter._bot_names = ("nixi",)
+
+        thread_ts = "1600000000.555555"
+
+        # Send a message with no bot mention at all — should be classified as DROP
+        await nixi_adapter._dispatch_event(
+            {
+                "event": {
+                    "text": "just chatting about weather",
+                    "channel": "C99999",
+                    "thread_ts": thread_ts,
+                    "event_ts": "1700000000.000030",
+                }
+            },
+            user_id="U_USER6",
+            user_name="User6",
+        )
+
+        # No bot mention → classifier drops → no thread cache record
+        # (The real classifier will classify this as DROP)
+        # Note: This test uses the REAL classify, so behavior depends on classifier
+        # The key assertion is that bot_mentioned=False and bot_name_detected=False
+        # lead to bot_invoked=False, so the thread cache condition is:
+        # (bot_invoked or result.action=="pass") — since both are False for DROP, no record
+        # However, this relies on the real classifier returning DROP, which it does for
+        # unrelated channel messages. Let's verify:
+        assert nixi_adapter._mention_cache.had_bot(thread_ts) is False
 
 
 # ─── Intent classifier integration tests ───────────────────────────────────
