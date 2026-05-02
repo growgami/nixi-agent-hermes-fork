@@ -620,3 +620,110 @@ class TestNixiEnvOverrides:
         assert nixi.token == "secret-abc123"
         assert nixi.extra.get("team_id") == "T01TEAMID"
         assert nixi.extra.get("custom_key") == "preserved"
+
+    def test_nixi_bot_user_id_bridged_to_extra(self):
+        """NIXI_BOT_USER_ID env var should be bridged to config extra."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_BOT_USER_ID": "UBOT12345",
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.extra.get("bot_user_id") == "UBOT12345"
+
+    def test_nixi_bot_user_id_empty_when_missing(self):
+        """When NIXI_BOT_USER_ID is not set, bot_user_id in extra defaults to empty string."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_TEAM_ID": "T01XYZ567AB",
+                "NIXI_BOT_USER_ID": "",  # explicitly empty
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.extra.get("bot_user_id") == ""
+
+    def test_nixi_bot_names_valid_json_bridged_to_extra(self):
+        """NIXI_BOT_NAMES env var with valid JSON list should be parsed and stored in extra."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_BOT_NAMES": '["nixi", "fixi", "robo"]',
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert nixi.extra.get("bot_names") == ["nixi", "fixi", "robo"]
+
+    def test_nixi_bot_names_invalid_json_logs_warning(self):
+        """Invalid NIXI_BOT_NAMES JSON should log a warning and NOT set bot_names in extra,
+        so the adapter falls back to its default."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_BOT_NAMES": "not-valid-json",
+            },
+            clear=False,
+        ):
+            with patch("gateway.config.logger") as mock_logger:
+                _apply_env_overrides(config)
+                # Should have logged a warning about NIXI_BOT_NAMES
+                warning_calls = [c for c in mock_logger.warning.call_args_list if "NIXI_BOT_NAMES" in str(c)]
+                assert len(warning_calls) >= 1
+
+        nixi = config.platforms[Platform.NIXI]
+        assert "bot_names" not in nixi.extra
+
+    def test_nixi_bot_names_not_set_no_key_in_extra(self):
+        """When NIXI_BOT_NAMES is not set, no bot_names key should be in extra,
+        so the adapter uses its default via extra.get('bot_names', ['nixi'])."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_BOT_NAMES": "",  # explicitly empty
+            },
+            clear=False,
+        ):
+            _apply_env_overrides(config)
+
+        nixi = config.platforms[Platform.NIXI]
+        assert "bot_names" not in nixi.extra
+
+    def test_nixi_bot_names_valid_json_not_list_logs_warning(self):
+        """NIXI_BOT_NAMES that's valid JSON but not a list should log a warning
+        and NOT set bot_names in extra."""
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ,
+            {
+                "NIXI_INTERNAL_SECRET": "secret-abc123",
+                "NIXI_BOT_NAMES": '"justastring"',
+            },
+            clear=False,
+        ):
+            with patch("gateway.config.logger") as mock_logger:
+                _apply_env_overrides(config)
+                warning_calls = [c for c in mock_logger.warning.call_args_list if "NIXI_BOT_NAMES" in str(c)]
+                assert len(warning_calls) >= 1
+
+        nixi = config.platforms[Platform.NIXI]
+        assert "bot_names" not in nixi.extra

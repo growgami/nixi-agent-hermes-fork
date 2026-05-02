@@ -1286,7 +1286,26 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.NIXI].token = nixi_secret
         config.platforms[Platform.NIXI].extra.update({
             "team_id": os.getenv("NIXI_TEAM_ID", ""),
+            "bot_user_id": os.getenv("NIXI_BOT_USER_ID", ""),
         })
+        bot_names_env = os.getenv("NIXI_BOT_NAMES", "")
+        if bot_names_env:
+            try:
+                parsed = json.loads(bot_names_env)
+                if isinstance(parsed, list):
+                    config.platforms[Platform.NIXI].extra["bot_names"] = parsed
+                else:
+                    logger.warning(
+                        "[nixi] NIXI_BOT_NAMES not valid JSON list — got %r; "
+                        "adapter will fall back to default bot names",
+                        bot_names_env,
+                    )
+            except json.JSONDecodeError:
+                logger.warning(
+                    "[nixi] NIXI_BOT_NAMES not valid JSON — got %r; "
+                    "adapter will fall back to default bot names",
+                    bot_names_env,
+                )
         nixi_port_str = os.getenv("NIXI_PORT", "")
         try:
             config.platforms[Platform.NIXI].extra["port"] = int(nixi_port_str) if nixi_port_str else 8080
