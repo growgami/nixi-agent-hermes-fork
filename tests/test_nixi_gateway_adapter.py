@@ -7,6 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nixi.intent_classifier import ClassificationResult
+
+# Default "pass" result for mocking the classifier in dispatch tests.
+# These tests focus on the adapter's dispatch logic, not the classifier,
+# so we bypass classification by always returning "pass".
+_CLASSIFY_PASS = ClassificationResult(action="pass", response_text=None, reason="test_pass")
+
 # Skip entire module if aiohttp not available
 try:
     from aiohttp import web
@@ -308,7 +315,8 @@ class TestEventDispatch:
     @pytest.mark.asyncio
     async def test_dispatch_creates_message_event_with_overlay(self, nixi_adapter):
         """Valid events should dispatch with employee overlay in channel_prompt."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value="# Employee context\nYou are helpful"):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value="# Employee context\nYou are helpful"):
             called_events = []
 
             async def capture_event(event):
@@ -338,7 +346,8 @@ class TestEventDispatch:
     @pytest.mark.asyncio
     async def test_dispatch_with_empty_overlay(self, nixi_adapter):
         """Empty overlay should result in channel_prompt=None."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -362,7 +371,8 @@ class TestEventDispatch:
     @pytest.mark.asyncio
     async def test_dispatch_extracts_thread_ts(self, nixi_adapter):
         """thread_ts should be extracted and passed to build_source."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -392,7 +402,8 @@ class TestEventDispatch:
     @pytest.mark.asyncio
     async def test_dispatch_flat_event_payload(self, nixi_adapter):
         """When event_data has no 'event' key, treat event_data itself as the event."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -416,7 +427,8 @@ class TestEventDispatch:
     @pytest.mark.asyncio
     async def test_dispatch_no_channel_creates_dm_chat_id(self, nixi_adapter):
         """Missing channel should create a DM-style chat_id."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -701,7 +713,8 @@ class TestDeduplication:
     @pytest.mark.asyncio
     async def test_dispatch_skips_duplicate_event_ts(self, nixi_adapter):
         """Duplicate event_ts should be skipped — only one MessageEvent dispatched."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -725,7 +738,8 @@ class TestDeduplication:
     @pytest.mark.asyncio
     async def test_dispatch_allows_different_event_ts(self, nixi_adapter):
         """Different event_ts values should both be processed."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -753,7 +767,8 @@ class TestDeduplication:
     @pytest.mark.asyncio
     async def test_dispatch_missing_event_ts_still_processes(self, nixi_adapter):
         """Events with no event_ts or ts should still be processed (dedup skipped for empty keys)."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):
@@ -775,7 +790,8 @@ class TestDeduplication:
     @pytest.mark.asyncio
     async def test_message_id_populated_from_event_ts(self, nixi_adapter):
         """MessageEvent.message_id should be set to the event_ts value."""
-        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+        with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
+             patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
 
             async def capture_event(event):

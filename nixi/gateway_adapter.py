@@ -40,6 +40,13 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from nixi.employee_provider import load_overlay
+from nixi.intent_classifier import (
+    ClassificationContext,
+    ClassificationResult,
+    ThreadMentionCache,
+    bot_mentioned_in_text,
+    classify,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +120,24 @@ class NixiAdapter(BasePlatformAdapter):
         # retries). Per-adapter-instance, consistent with single-tenant-per-
         # Machine architecture.
         self._dedup = MessageDeduplicator()
+
+        # Intent classifier: pre-LLM classifier that gates messages
+        # before they reach the main agent. ThreadMentionCache tracks which
+        # threads the bot has engaged in for thread-continuation detection.
+        self._mention_cache: ThreadMentionCache = ThreadMentionCache(
+            ttl=1800, max_size=1024
+        )
+
+        # Bot user ID for detecting direct mentions (<@UBOT123>). Used by
+        # the classifier to determine bot_mentioned. Log a warning when
+        # unset — the classifier cannot detect channel mentions without it.
+        self._bot_user_id: str = os.getenv(
+            "NIXI_BOT_USER_ID", extra.get("bot_user_id", "")
+        )
+        if not self._bot_user_id:
+            logger.warning(
+                "[nixi] NIXI_BOT_USER_ID not set — classifier will not detect channel mentions"
+            )
 
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -317,11 +342,27 @@ class NixiAdapter(BasePlatformAdapter):
         user_id: str,
         user_name: str,
     ) -> None:
-        """Extract Slack event fields, load overlay, construct MessageEvent, and dispatch."""
+        """Extract Slack event fields, classify intent, and dispatch accordingly.
+
+        Classification determines whether to DROP (discard), RESPOND (send
+        direct reply without LLM), or PASS (continue to overlay load + LLM).
+        """
         # Extract Slack event fields from the payload
         # Sludge sends the full Slack event envelope; the relevant fields
         # are in event_data itself or event_data.get("event", {})
         event = event_data.get("event", event_data)
+
+        # Subtype filter: only process regular user messages (subtype=None).
+        # Subtypes like "message_changed", "bot_add", "file_share" etc. are
+        # not user-originated messages and should not reach the classifier.
+        subtype = event.get("subtype")
+        if subtype:
+            logger.debug(
+                "[nixi] Skipping event with subtype=%s event_ts=%s",
+                subtype,
+                event.get("event_ts", "?"),
+            )
+            return
 
         # Slack event field mapping: message events have both 'event_ts' and
         # 'ts' (typically equal). Use event_ts first (more specific), fall back
@@ -340,6 +381,71 @@ class NixiAdapter(BasePlatformAdapter):
         channel = event.get("channel", "")
         thread_ts = event.get("thread_ts")
 
+        # ── Intent classification ──────────────────────────────────────
+        # Determine DM status: channel_type=="im" is primary, "D" prefix
+        # on channel ID is Slack's DM convention. Empty channel defaults to
+        # NOT DM — never assume DM from absence of data.
+        is_dm = event.get("channel_type") == "im" or (
+            bool(channel) and channel.startswith("D")
+        )
+
+        # Determine bot mention status
+        bot_mentioned = bot_mentioned_in_text(text, self._bot_user_id)
+
+        # Determine thread-continuation status from cache
+        thread_had_bot = (
+            self._mention_cache.had_bot(thread_ts) if thread_ts else False
+        )
+
+        ctx = ClassificationContext(
+            text=text,
+            channel=channel,
+            is_dm=is_dm,
+            thread_ts=thread_ts,
+            bot_user_id=self._bot_user_id or None,
+            thread_had_bot=thread_had_bot,
+        )
+        result = classify(ctx)
+
+        logger.info(
+            "[nixi] Classified event: user=%s channel=%s action=%s reason=%s text_len=%d",
+            user_id,
+            channel,
+            result.action,
+            result.reason,
+            len(text),
+        )
+
+        # Record thread presence when the bot will engage: (a) directly
+        # mentioned, or (b) classified as PASS for a thread message (nixi
+        # will respond in this thread, making bot "present" for future
+        # continuation detection).
+        if thread_ts and (bot_mentioned or result.action == "pass"):
+            self._mention_cache.record(thread_ts)
+
+        if result.action == "drop":
+            logger.info(
+                "[nixi] Dropping event: reason=%s user=%s channel=%s",
+                result.reason,
+                user_id,
+                channel,
+            )
+            return
+
+        if result.action == "respond":
+            logger.info(
+                "[nixi] Responding directly: reason=%s user=%s channel=%s",
+                result.reason,
+                user_id,
+                channel,
+            )
+            # For DMs, channel is the DM channel ID (e.g. "D12345").
+            # For channels, channel is the channel ID (e.g. "C12345").
+            send_chat_id = channel or f"nixi:{user_id}"
+            await self.send(send_chat_id, result.response_text, reply_to=thread_ts)
+            return
+
+        # PASS: continue to overlay load + LLM
         # Load employee overlay for ephemeral context injection (cached)
         overlay = self._get_overlay_with_cache(user_id)
 
@@ -364,7 +470,7 @@ class NixiAdapter(BasePlatformAdapter):
         )
 
         logger.info(
-            "[nixi] Dispatching event: user=%s channel=%s text_len=%d overlay=%d",
+            "[nixi] Dispatching event (action=pass): user=%s channel=%s text_len=%d overlay=%d",
             user_id,
             channel,
             len(text),
