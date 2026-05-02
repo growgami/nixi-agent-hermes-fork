@@ -42,7 +42,17 @@ fi
 
 # --- Venv ---
 echo -e "${CYAN}→${NC} Setting up virtual environment..."
-[ -d ".venv" ] && rm -rf .venv
+if [ -d ".venv" ]; then
+    rm -rf .venv || true
+    if [ -d ".venv" ]; then
+        echo -e "${YELLOW}⚠${NC} .venv partially in use, retrying removal..."
+        rm -rf .venv || true
+        if [ -d ".venv" ]; then
+            echo -e "${RED}✗${NC} Cannot remove .venv — close any shells using it and retry."
+            exit 1
+        fi
+    fi
+fi
 $UV_CMD venv .venv --python "$PYTHON_VERSION" && echo -e "${GREEN}✓${NC} .venv created (Python $PYTHON_VERSION)"
 export VIRTUAL_ENV="$SCRIPT_DIR/.venv"
 SETUP_PYTHON="$SCRIPT_DIR/.venv/bin/python"
