@@ -43,7 +43,7 @@ def generate_seed_config(
         "log_dir": "",  # resolved at runtime from HERMES_HOME or ~/.nixi
         "output_dir": "",  # resolved at runtime from HERMES_HOME or ~/.nixi/output
         "extraction_batch_size": 50,
-        "bot_names": ["Fixi", "nixi"],
+        "bot_names": ["nixi"],
         "cooccurrence_threshold": 3,
         "memory_limit": 10000,
         "employee_limit": 1375,

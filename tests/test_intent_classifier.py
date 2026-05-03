@@ -765,16 +765,15 @@ class TestBotNameMentioned:
 
     def test_name_at_word_boundary(self):
         """Name at word boundary → True."""
-        assert bot_name_mentioned("hey nixi help", ("nixi", "Fixi")) is True
+        assert bot_name_mentioned("hey nixi help", ("nixi",)) is True
 
     def test_name_case_insensitive(self):
         """Matching is case-insensitive."""
-        assert bot_name_mentioned("hey NIXI help", ("nixi", "Fixi")) is True
-        assert bot_name_mentioned("hey fixi help", ("nixi", "Fixi")) is True
+        assert bot_name_mentioned("hey NIXI help", ("nixi",)) is True
 
     def test_name_not_at_word_boundary(self):
         """Name embedded in another word → False (no false positive)."""
-        assert bot_name_mentioned("hey nixification", ("nixi", "Fixi")) is False
+        assert bot_name_mentioned("hey nixification", ("nixi",)) is False
 
     def test_name_at_start_of_text(self):
         """Name at the beginning of text → True (\\b matches start boundary)."""
@@ -790,11 +789,11 @@ class TestBotNameMentioned:
 
     def test_multiple_names_match(self):
         """Any name match → True."""
-        assert bot_name_mentioned("hey Fixi help", ("nixi", "Fixi")) is True
+        assert bot_name_mentioned("hey roxi help", ("nixi", "roxi")) is True
 
     def test_no_matching_name(self):
         """No name match → False."""
-        assert bot_name_mentioned("hey alexa help", ("nixi", "Fixi")) is False
+        assert bot_name_mentioned("hey alexa help", ("nixi",)) is False
 
     def test_name_with_punctuation(self):
         """Names with punctuation should be escaped and matched at word boundary."""
@@ -803,9 +802,42 @@ class TestBotNameMentioned:
         assert bot_name_mentioned("hey fix-bot!", ("fix-bot",)) is True
 
     def test_name_does_not_match_substring(self):
-        """'nix' should not match 'nixi' and vice versa."""
+        """With lenient matching, short names match the prefix of longer names.
+        But a bot name should not match an unrelated longer word."""
+        # "nix" is the 3-char prefix of "nixi" → lenient match
+        assert bot_name_mentioned("hey nix", ("nixi",)) is True
+        # "nixi" should not match when bot name is "nix" (short name, exact only)
         assert bot_name_mentioned("hey nixi", ("nix",)) is False
-        assert bot_name_mentioned("hey nix", ("nixi",)) is False
+
+    def test_lenient_prefix_match_three_char_prefix(self):
+        """Lenient matching: 3-char prefix of "nixi" matches "nix"."""
+        assert bot_name_mentioned("nix help me", ("nixi",)) is True
+
+    def test_lenient_excited_typing(self):
+        """Lenient matching: repeated trailing char matches "nixiiiii"."""
+        assert bot_name_mentioned("nixiiiii help", ("nixi",)) is True
+
+    def test_lenient_case_insensitive_prefix(self):
+        """Lenient matching: case-insensitive prefix match."""
+        assert bot_name_mentioned("NIX help", ("nixi",)) is True
+
+    def test_lenient_exact_match_still_works(self):
+        """Lenient matching: exact name still matches."""
+        assert bot_name_mentioned("nixi help", ("nixi",)) is True
+
+    def test_lenient_rejects_embedded_word(self):
+        """Lenient matching: "nixification" should NOT match "nixi".
+
+        The trailing i* matches the "i" in "nixification" but the word
+        boundary after i* fails because "f" follows.
+        """
+        assert bot_name_mentioned("nixification", ("nixi",)) is False
+
+    def test_lenient_short_name_exact_only(self):
+        """Names shorter than 3 chars use exact match only."""
+        assert bot_name_mentioned("ab help", ("ab",)) is True
+        assert bot_name_mentioned("a help", ("a",)) is True
+        assert bot_name_mentioned("abc help", ("ab",)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -837,9 +869,9 @@ class TestClassificationContextBotNames:
             thread_ts=None,
             bot_user_id="U1",
             thread_had_bot=False,
-            bot_names=("nixi", "Fixi"),
+            bot_names=("nixi",),
         )
-        assert ctx.bot_names == ("nixi", "Fixi")
+        assert ctx.bot_names == ("nixi",)
 
     def test_frozen_with_bot_names(self):
         """ClassificationContext remains frozen with bot_names field."""
@@ -995,7 +1027,7 @@ class TestClassifyIntegrationWithBotNames:
             channel="C12345",
             is_dm=False,
             bot_user_id=None,
-            bot_names=("nixi", "Fixi"),
+            bot_names=("nixi",),
         )
         result = classify(ctx)
         assert result.action == "pass"

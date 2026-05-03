@@ -101,7 +101,7 @@ class TestNixiConfigFromEnv:
 
         config = NixiConfig.from_env()
         assert config.extraction_batch_size == 50
-        assert config.bot_names == ["Fixi", "nixi"]
+        assert config.bot_names == ["nixi"]
         assert config.cooccurrence_threshold == 3
         assert config.memory_limit == 10_000
         assert config.employee_limit == 1375

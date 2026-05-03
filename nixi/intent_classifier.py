@@ -60,7 +60,7 @@ class ClassificationContext:
         thread_had_bot: True when ThreadMentionCache records prior bot
                       engagement in this thread.
         bot_names:    Tuple of bot display names for natural-language mention
-                      detection (e.g. ("nixi", "Fixi")). When non-empty,
+                      detection (e.g. ("nixi",)). When non-empty,
                       triggers name-based matching in mention-dependent rules
                       alongside <@USERID> matching. Default empty tuple for
                       backward compatibility. Adapters should always include
@@ -218,17 +218,32 @@ def bot_mentioned_in_text(text: str, bot_user_id: str) -> bool:
 
 
 def bot_name_mentioned(text: str, bot_names: tuple[str, ...]) -> bool:
-    """Return True if any bot name appears as a word-boundary match in text.
+    """Return True if any bot name is mentioned in text, using lenient matching.
 
-    Uses case-insensitive regex with ``\\b`` word boundaries to avoid
-    false positives from substrings (e.g. "nixification" won't match "nixi").
+    For names with 3+ characters, matches the bot name's **prefix** (first
+    N-1 characters) followed by zero or more repetitions of the last character,
+    bounded by word boundaries. This recognises casual typing variations like
+    "nix" for "nixi" or "nixiiiii" for excited typing, while rejecting
+    false-positive substrings like "nixification".
+
+    Algorithm per name:
+        - Length < 3: use exact word-boundary match ``\\b{name}\\b``
+        - Length ≥ 3: prefix = name[:-1], last_char = name[-1].
+          Pattern: ``\\b{prefix}{last_char}*\\b`` with ``re.IGNORECASE``.
+
+    Examples with bot name "nixi":
+        - "nix"   → matches (3-char prefix, zero trailing i's)    ✅
+        - "Nixi"  → matches (case-insensitive exact)              ✅
+        - "nixi"  → matches (exact)                                ✅
+        - "nixiiiii" → matches (excited typing)                    ✅
+        - "nixification" → no match (word boundary fails after i) ❌
 
     Args:
         text:      The message text to search.
         bot_names: Tuple of bot display names to look for.
 
     Returns:
-        True if any name matches at a word boundary, False otherwise.
+        True if any name matches, False otherwise.
         Returns False when bot_names is empty (conservative — no false positives).
 
     Note:
@@ -239,8 +254,18 @@ def bot_name_mentioned(text: str, bot_names: tuple[str, ...]) -> bool:
     """
     if not bot_names:
         return False
+    parts: list[str] = []
+    for name in bot_names:
+        if len(name) < 3:
+            # Short names: exact word-boundary match only
+            parts.append(re.escape(name))
+        else:
+            # Lenient prefix match: prefix + last_char repeated zero or more times
+            prefix = re.escape(name[:-1])
+            last_char = re.escape(name[-1])
+            parts.append(f"{prefix}{last_char}*")
     pattern = re.compile(
-        r"\b(" + "|".join(re.escape(name) for name in bot_names) + r")\b",
+        r"\b(" + "|".join(parts) + r")\b",
         re.IGNORECASE,
     )
     return bool(pattern.search(text))

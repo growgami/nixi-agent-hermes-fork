@@ -209,7 +209,6 @@ class TestRawUidAndBot:
 
     def test_is_bot_message_default(self, parser: LogParser):
         assert parser.is_bot_message("nixi") is True
-        assert parser.is_bot_message("Fixi") is True
 
     def test_is_bot_message_normal_user(self, parser: LogParser):
         assert parser.is_bot_message("Jin") is False
@@ -222,7 +221,7 @@ class TestRawUidAndBot:
     def test_is_bot_message_custom_list(self, parser: LogParser):
         custom = ["CustomBot", "AnotherBot"]
         assert parser.is_bot_message("CustomBot", custom) is True
-        assert parser.is_bot_message("Fixi", custom) is False
+        assert parser.is_bot_message("nixi", custom) is False
         assert parser.is_bot_message("Jin", custom) is False
 
 

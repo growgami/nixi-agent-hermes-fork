@@ -17,7 +17,6 @@ nixi:
   output_dir: ''
   extraction_batch_size: 50
   bot_names:
-  - Fixi
   - nixi
   cooccurrence_threshold: 3
   memory_limit: 10000

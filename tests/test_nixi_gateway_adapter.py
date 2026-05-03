@@ -134,50 +134,50 @@ class TestNixiAdapterInit:
         """bot_names from config extra should be used, with 'nixi' always included."""
         from nixi.gateway_adapter import NixiAdapter
 
-        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "robo"]})
         adapter = NixiAdapter(config)
         assert "nixi" in adapter._bot_names
-        assert "fixi" in adapter._bot_names
+        assert "robo" in adapter._bot_names
 
     def test_bot_names_env_var_overrides_config(self):
         """NIXI_BOT_NAMES env var (JSON list) should override config extra."""
         from nixi.gateway_adapter import NixiAdapter
 
-        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
-        with patch.dict(os.environ, {"NIXI_BOT_NAMES": '["nixi", "robo"]'}):
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "robo"]})
+        with patch.dict(os.environ, {"NIXI_BOT_NAMES": '["nixi", "altbot"]'}):
             adapter = NixiAdapter(config)
             assert "nixi" in adapter._bot_names
-            assert "robo" in adapter._bot_names
-            assert "fixi" not in adapter._bot_names
+            assert "altbot" in adapter._bot_names
+            assert "robo" not in adapter._bot_names
 
     def test_bot_names_env_var_invalid_json_falls_back(self):
         """Invalid NIXI_BOT_NAMES JSON should fall back to config extra."""
         from nixi.gateway_adapter import NixiAdapter
 
-        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "robo"]})
         with patch.dict(os.environ, {"NIXI_BOT_NAMES": "not-json"}):
             adapter = NixiAdapter(config)
             assert "nixi" in adapter._bot_names
-            assert "fixi" in adapter._bot_names
+            assert "robo" in adapter._bot_names
 
     def test_bot_names_env_var_not_a_list_falls_back(self):
         """NIXI_BOT_NAMES that's valid JSON but not a list should fall back to config."""
         from nixi.gateway_adapter import NixiAdapter
 
-        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "fixi"]})
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["nixi", "robo"]})
         with patch.dict(os.environ, {"NIXI_BOT_NAMES": '"justastring"'}):
             adapter = NixiAdapter(config)
             assert "nixi" in adapter._bot_names
-            assert "fixi" in adapter._bot_names
+            assert "robo" in adapter._bot_names
 
     def test_bot_names_always_includes_nixi_even_if_config_omits(self):
         """Even if config extra lists names without 'nixi', 'nixi' must be included."""
         from nixi.gateway_adapter import NixiAdapter
 
-        config = PlatformConfig(enabled=True, extra={"bot_names": ["fixi"]})
+        config = PlatformConfig(enabled=True, extra={"bot_names": ["robo"]})
         adapter = NixiAdapter(config)
         assert "nixi" in adapter._bot_names
-        assert "fixi" in adapter._bot_names
+        assert "robo" in adapter._bot_names
 
 
 # ─── Health endpoint ──────────────────────────────────────────────────────
@@ -1307,7 +1307,7 @@ class TestIntentClassifierIntegration:
         """Channel "nixi summarize the thread" (no <@...> mention) with bot_names
         → substantive_mention_rule fires via name detection → PASS (message reaches agent)."""
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter._bot_names = ("nixi", "Fixi")
+        nixi_adapter._bot_names = ("nixi",)
 
         called_events = []
 
@@ -1331,16 +1331,16 @@ class TestIntentClassifierIntegration:
 
     @pytest.mark.asyncio
     async def test_channel_name_mention_greeting_drops(self, nixi_adapter):
-        """Channel "hey fixi" (no <@...> mention, name-only greeting) → DROP.
+        """Channel "hey nixi" (no <@...> mention, name-only greeting) → DROP.
 
         The classifier's _is_greeting_only only strips <@U...> mentions, not bot
-        names, so "hey fixi" retains "fixi" after greeting removal and is not
+        names, so "hey nixi" retains "nixi" after greeting removal and is not
         recognized as greeting-only. It falls through to unrelated_drop_rule.
         This test documents the current behavior: name-only greetings without
         substantive content are dropped rather than responded to.
         """
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter._bot_names = ("nixi", "Fixi")
+        nixi_adapter._bot_names = ("nixi",)
         nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
@@ -1352,7 +1352,7 @@ class TestIntentClassifierIntegration:
         nixi_adapter._message_handler = capture_event
 
         await nixi_adapter._dispatch_event(
-            self._make_channel_event("hey fixi"),
+            self._make_channel_event("hey nixi"),
             user_id="U_NAME_GREET",
             user_name="NameGreeting",
         )
@@ -1371,7 +1371,7 @@ class TestIntentClassifierIntegration:
         Contrast with "<@BOTID> thanks" which hits noise_mention_rule.
         """
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter._bot_names = ("nixi", "Fixi")
+        nixi_adapter._bot_names = ("nixi",)
         nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
@@ -1402,7 +1402,7 @@ class TestIntentClassifierIntegration:
         cause double-processing or errors when both match a message.
         """
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter._bot_names = ("nixi", "Fixi")
+        nixi_adapter._bot_names = ("nixi",)
 
         called_events = []
 

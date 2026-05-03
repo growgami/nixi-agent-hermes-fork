@@ -62,7 +62,7 @@ class LogParser:
     """
 
     # Default bot names — configurable via is_bot_message()
-    DEFAULT_BOT_NAMES: list[str] = ["Fixi", "nixi"]
+    DEFAULT_BOT_NAMES: list[str] = ["nixi"]
 
     def parse_line(self, line: str) -> ParsedLine | None:
         """Parse a single line into a ParsedLine.
