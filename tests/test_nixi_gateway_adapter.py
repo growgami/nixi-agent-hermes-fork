@@ -1299,3 +1299,153 @@ class TestIntentClassifierIntegration:
         await asyncio.sleep(0.05)
         nixi_adapter.send.assert_not_called()
         assert len(called_events) == 0
+
+    # ─── Bot name mention integration tests ──────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_channel_name_mention_substantive_pass(self, nixi_adapter):
+        """Channel "nixi summarize the thread" (no <@...> mention) with bot_names
+        → substantive_mention_rule fires via name detection → PASS (message reaches agent)."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter._bot_names = ("nixi", "Fixi")
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return None
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event("nixi summarize the thread"),
+                user_id="U_NAME_SUB",
+                user_name="NameSubstantive",
+            )
+
+        # PASS: background task created, handle_message called
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        assert called_events[0].text == "nixi summarize the thread"
+
+    @pytest.mark.asyncio
+    async def test_channel_name_mention_greeting_drops(self, nixi_adapter):
+        """Channel "hey fixi" (no <@...> mention, name-only greeting) → DROP.
+
+        The classifier's _is_greeting_only only strips <@U...> mentions, not bot
+        names, so "hey fixi" retains "fixi" after greeting removal and is not
+        recognized as greeting-only. It falls through to unrelated_drop_rule.
+        This test documents the current behavior: name-only greetings without
+        substantive content are dropped rather than responded to.
+        """
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter._bot_names = ("nixi", "Fixi")
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event("hey fixi"),
+            user_id="U_NAME_GREET",
+            user_name="NameGreeting",
+        )
+
+        # DROP: name-mention greeting not recognized as greeting-only → unrelated_drop
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_channel_name_mention_noise_drop(self, nixi_adapter):
+        """Channel "nixi thanks" (no <@...> mention) → DROP.
+
+        Name-mention acknowledgment that _is_acknowledgment doesn't recognize
+        (because it doesn't strip bot names), falling through to unrelated_drop.
+        Contrast with "<@BOTID> thanks" which hits noise_mention_rule.
+        """
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter._bot_names = ("nixi", "Fixi")
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event("nixi thanks"),
+            user_id="U_NAME_NOISE",
+            user_name="NameNoise",
+        )
+
+        # DROP: no send, no background task
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_channel_name_and_slack_mention_both_pass(self, nixi_adapter):
+        """Channel "<@BOT_USER_ID> summarize the thread" with both <@...> mention
+        AND name mention → PASS (no double-classification or errors).
+
+        Verifies that having both bot_user_id and bot_names configured doesn't
+        cause double-processing or errors when both match a message.
+        """
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter._bot_names = ("nixi", "Fixi")
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return None
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event(f"<@{self.BOT_USER_ID}> summarize the thread"),
+                user_id="U_BOTH_MENTION",
+                user_name="BothMention",
+            )
+
+        # PASS: exactly one event dispatched (no double-processing)
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_bot_names_no_false_positives(self, nixi_adapter):
+        """_bot_names = () with "hey nixi" (no <@...> mention) → DROP (no names to match,
+        unrelated_drop_rule fires). Verifies no false positives without bot_names."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+        nixi_adapter._bot_names = ()
+        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event("hey nixi"),
+            user_id="U_NO_NAMES",
+            user_name="NoNames",
+        )
+
+        # DROP: no name match, no slack mention, unrelated_drop_rule fires
+        await asyncio.sleep(0.05)
+        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
