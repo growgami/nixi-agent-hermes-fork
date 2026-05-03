@@ -13,6 +13,8 @@ from pathlib import Path
 
 import yaml
 
+from hermes_constants import get_hermes_home
+
 
 _DEFAULT_BOT_NAMES = ["nixi"]
 
@@ -29,6 +31,7 @@ class NixiConfig:
         cooccurrence_threshold: Minimum co-occurrence count for relationship mapping.
         memory_limit: Maximum messages to keep in working memory.
         employee_limit: Maximum employee records to process.
+        rules_limit: Maximum character size of RULES.md before consolidation.
         extraction_model: LLM model for extraction tasks.
     """
 
@@ -39,7 +42,18 @@ class NixiConfig:
     cooccurrence_threshold: int = 3
     memory_limit: int = 10_000
     employee_limit: int = 1375
+    rules_limit: int = 10_000
     extraction_model: str = ""
+
+    @property
+    def hermes_home(self) -> Path:
+        """Profile-aware HERMES_HOME path, delegated to hermes_constants."""
+        return get_hermes_home()
+
+    @property
+    def nixi_dir(self) -> Path:
+        """Convenience path to hermes_home / nixi for writers and prompt_builder."""
+        return self.hermes_home / "nixi"
 
     @property
     def db_path(self) -> Path:
@@ -92,6 +106,7 @@ class NixiConfig:
             cooccurrence_threshold=nixi.get("cooccurrence_threshold", 3),
             memory_limit=nixi.get("memory_limit", 10_000),
             employee_limit=nixi.get("employee_limit", 1375),
+            rules_limit=nixi.get("rules_limit", 10_000),
             extraction_model=extraction_model,
         )
 
@@ -109,6 +124,7 @@ class NixiConfig:
             NIXI_COOCCURRENCE_THRESHOLD: Min co-occurrence count (default: 3).
             NIXI_MEMORY_LIMIT: Max messages in working memory (default: 10000).
             NIXI_EMPLOYEE_LIMIT: Max employee records (default: 1375).
+            NIXI_RULES_LIMIT: Max character size for RULES.md (default: 10000).
             NIXI_MODEL: LLM model for extraction (fallback: NIXI_EXTRACTION_MODEL).
         """
         log_dir_str = os.environ.get("NIXI_LOG_DIR", "")
@@ -140,6 +156,7 @@ class NixiConfig:
         cooccurrence_threshold = int(os.environ.get("NIXI_COOCCURRENCE_THRESHOLD", "3"))
         memory_limit = int(os.environ.get("NIXI_MEMORY_LIMIT", "10000"))
         employee_limit = int(os.environ.get("NIXI_EMPLOYEE_LIMIT", "1375"))
+        rules_limit = int(os.environ.get("NIXI_RULES_LIMIT", "10000"))
 
         # NIXI_MODEL takes priority; NIXI_EXTRACTION_MODEL as fallback
         extraction_model = os.environ.get("NIXI_MODEL", "") or os.environ.get("NIXI_EXTRACTION_MODEL", "")
@@ -152,5 +169,6 @@ class NixiConfig:
             cooccurrence_threshold=cooccurrence_threshold,
             memory_limit=memory_limit,
             employee_limit=employee_limit,
+            rules_limit=rules_limit,
             extraction_model=extraction_model,
         )

@@ -125,6 +125,59 @@ class TestNixiConfigFromEnv:
         config = NixiConfig.from_env()
         assert config.output_dir == Path.home() / ".nixi" / "output"
 
+    def test_hermes_home_property_returns_get_hermes_home(self, tmp_path: Path, monkeypatch):
+        """NixiConfig.hermes_home delegates to get_hermes_home() for profile-aware paths."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = NixiConfig(
+            log_dir=tmp_path / "logs",
+            output_dir=tmp_path / "output",
+        )
+        assert config.hermes_home == hermes_home
+
+    def test_nixi_dir_property_returns_hermes_home_nixi(self, tmp_path: Path, monkeypatch):
+        """NixiConfig.nixi_dir returns hermes_home / 'nixi'."""
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = NixiConfig(
+            log_dir=tmp_path / "logs",
+            output_dir=tmp_path / "output",
+        )
+        assert config.nixi_dir == hermes_home / "nixi"
+
+    def test_rules_limit_default(self, tmp_path: Path, monkeypatch):
+        """NixiConfig.rules_limit defaults to 10_000."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        config = NixiConfig(
+            log_dir=tmp_path / "logs",
+            output_dir=tmp_path / "output",
+        )
+        assert config.rules_limit == 10_000
+
+    def test_rules_limit_from_env(self, tmp_path: Path, monkeypatch):
+        """NixiConfig.from_env() reads NIXI_RULES_LIMIT env var."""
+        monkeypatch.setenv("NIXI_RULES_LIMIT", "5000")
+        monkeypatch.delenv("NIXI_LOG_DIR", raising=False)
+        monkeypatch.delenv("NIXI_OUTPUT_DIR", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        config = NixiConfig.from_env()
+        assert config.rules_limit == 5000
+
+    def test_rules_limit_env_default(self, tmp_path: Path, monkeypatch):
+        """NixiConfig.from_env() defaults rules_limit to 10_000 when env var not set."""
+        monkeypatch.delenv("NIXI_RULES_LIMIT", raising=False)
+        monkeypatch.delenv("NIXI_LOG_DIR", raising=False)
+        monkeypatch.delenv("NIXI_OUTPUT_DIR", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        config = NixiConfig.from_env()
+        assert config.rules_limit == 10_000
+
 
 # ── NixiConfig from_config ─────────────────────────────────────────────────────
 
@@ -187,6 +240,33 @@ class TestNixiConfigFromConfig:
 
         config = NixiConfig.from_config(config_file)
         assert config.extraction_model == "gpt-4o"
+
+    def test_reads_rules_limit_from_config(self, tmp_path: Path, monkeypatch):
+        """Config reads nixi.rules_limit from YAML."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "nixi:\n"
+            "  log_dir: /tmp/logs\n"
+            "  output_dir: /tmp/output\n"
+            "  rules_limit: 5000\n",
+            encoding="utf-8",
+        )
+
+        config = NixiConfig.from_config(config_file)
+        assert config.rules_limit == 5000
+
+    def test_rules_limit_default_from_config(self, tmp_path: Path, monkeypatch):
+        """Config defaults rules_limit to 10_000 when not specified."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "nixi:\n"
+            "  log_dir: /tmp/logs\n"
+            "  output_dir: /tmp/output\n",
+            encoding="utf-8",
+        )
+
+        config = NixiConfig.from_config(config_file)
+        assert config.rules_limit == 10_000
 
     def test_missing_config_file_uses_defaults(self, tmp_path: Path, monkeypatch):
         """Missing config file uses defaults."""
