@@ -19,6 +19,13 @@ Rules:
     noise_mention_rule       — Bot mentioned + acknowledgment/noise → DROP
     unrelated_drop_rule     — Catch-all → DROP
 
+Bot mention detection:
+    Mention-dependent rules recognize bot invocations via both:
+    - <@USERID> Slack mentions (via bot_mentioned_in_text)
+    - Natural-language name mentions (via bot_name_mentioned)
+    The ``bot_names`` field on ClassificationContext triggers name-based
+    matching. Adapters should always include "nixi" as a default.
+
 ThreadMentionCache tracks which threads the bot has engaged in,
 enabling thread continuation detection without Slack API calls.
 """
@@ -52,6 +59,12 @@ class ClassificationContext:
                       NIXI_BOT_USER_ID is unset.
         thread_had_bot: True when ThreadMentionCache records prior bot
                       engagement in this thread.
+        bot_names:    Tuple of bot display names for natural-language mention
+                      detection (e.g. ("nixi", "Fixi")). When non-empty,
+                      triggers name-based matching in mention-dependent rules
+                      alongside <@USERID> matching. Default empty tuple for
+                      backward compatibility. Adapters should always include
+                      "nixi" as a default.
     """
 
     text: str
@@ -60,6 +73,7 @@ class ClassificationContext:
     thread_ts: Optional[str]
     bot_user_id: Optional[str]
     thread_had_bot: bool
+    bot_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -203,6 +217,35 @@ def bot_mentioned_in_text(text: str, bot_user_id: str) -> bool:
     return f"<@{bot_user_id}>" in text
 
 
+def bot_name_mentioned(text: str, bot_names: tuple[str, ...]) -> bool:
+    """Return True if any bot name appears as a word-boundary match in text.
+
+    Uses case-insensitive regex with ``\\b`` word boundaries to avoid
+    false positives from substrings (e.g. "nixification" won't match "nixi").
+
+    Args:
+        text:      The message text to search.
+        bot_names: Tuple of bot display names to look for.
+
+    Returns:
+        True if any name matches at a word boundary, False otherwise.
+        Returns False when bot_names is empty (conservative — no false positives).
+
+    Note:
+        Names containing non-word characters (hyphens, apostrophes) may not
+        match correctly with ``\\b`` boundaries since ``\\b`` transitions
+        between ``\\w`` and ``\\W`` chars. For such names, a different boundary
+        strategy may be needed in the future.
+    """
+    if not bot_names:
+        return False
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(name) for name in bot_names) + r")\b",
+        re.IGNORECASE,
+    )
+    return bool(pattern.search(text))
+
+
 def _is_greeting_only(text: str) -> bool:
     """Return True if text is a greeting with no substantive content.
 
@@ -334,10 +377,12 @@ def thread_continuation_rule(ctx: ClassificationContext) -> Optional[Classificat
 
 
 def substantive_mention_rule(ctx: ClassificationContext) -> Optional[ClassificationResult]:
-    """Bot mentioned with substantive content → PASS."""
-    if not ctx.bot_user_id:
-        return None
-    if not bot_mentioned_in_text(ctx.text, ctx.bot_user_id):
+    """Bot mentioned with substantive content → PASS.
+
+    Recognizes both <@USERID> mentions and natural-language bot name mentions.
+    """
+    bot_invoked = bot_mentioned_in_text(ctx.text, ctx.bot_user_id) or bot_name_mentioned(ctx.text, ctx.bot_names)
+    if not bot_invoked:
         return None
     if _is_substantive(ctx.text):
         return ClassificationResult(
@@ -349,10 +394,12 @@ def substantive_mention_rule(ctx: ClassificationContext) -> Optional[Classificat
 
 
 def greeting_mention_rule(ctx: ClassificationContext) -> Optional[ClassificationResult]:
-    """Bot mentioned with greeting-only content → RESPOND with nohello.net."""
-    if not ctx.bot_user_id:
-        return None
-    if not bot_mentioned_in_text(ctx.text, ctx.bot_user_id):
+    """Bot mentioned with greeting-only content → RESPOND with nohello.net.
+
+    Recognizes both <@USERID> mentions and natural-language bot name mentions.
+    """
+    bot_invoked = bot_mentioned_in_text(ctx.text, ctx.bot_user_id) or bot_name_mentioned(ctx.text, ctx.bot_names)
+    if not bot_invoked:
         return None
     if _is_greeting_only(ctx.text):
         return ClassificationResult(
@@ -364,10 +411,12 @@ def greeting_mention_rule(ctx: ClassificationContext) -> Optional[Classification
 
 
 def noise_mention_rule(ctx: ClassificationContext) -> Optional[ClassificationResult]:
-    """Bot mentioned with acknowledgment/noise content → DROP."""
-    if not ctx.bot_user_id:
-        return None
-    if not bot_mentioned_in_text(ctx.text, ctx.bot_user_id):
+    """Bot mentioned with acknowledgment/noise content → DROP.
+
+    Recognizes both <@USERID> mentions and natural-language bot name mentions.
+    """
+    bot_invoked = bot_mentioned_in_text(ctx.text, ctx.bot_user_id) or bot_name_mentioned(ctx.text, ctx.bot_names)
+    if not bot_invoked:
         return None
     if _is_acknowledgment(ctx.text):
         return ClassificationResult(

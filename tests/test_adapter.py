@@ -228,7 +228,7 @@ class TestBotTagging:
         """Bot messages tagged is_bot=true (not discarded)."""
         chan_dir = log_dir / "C06M81FSKFF"
         _write_channel_log(chan_dir, "2025-12.log", (
-            "[1766766571.000001] @Toothless: I'm a bot\n"
+            "[1766766571.000001] @nixi: I'm a bot\n"
             "[1766766571.000002] @Kuro: I'm a human\n"
         ))
 
@@ -238,8 +238,8 @@ class TestBotTagging:
         conn = get_connection(adapter.config.db_path)
         cursor = conn.execute("SELECT user_name, is_bot FROM scraped_messages ORDER BY slack_ts")
         rows = cursor.fetchall()
-        # Toothless is a bot
-        assert rows[0]["user_name"] == "Toothless"
+        # nixi is a bot
+        assert rows[0]["user_name"] == "nixi"
         assert rows[0]["is_bot"] == 1
         # Kuro is not a bot
         assert rows[1]["user_name"] == "Kuro"

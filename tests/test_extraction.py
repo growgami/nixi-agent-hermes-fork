@@ -411,12 +411,12 @@ class TestBotMessageTagging:
         """Bot messages get [BOT] prefix in formatted batch."""
         batcher = ExtractionBatcher.__new__(ExtractionBatcher)
         messages = [
-            {"is_bot": 1, "user_name": "Toothless", "text": "Build passed"},
+            {"is_bot": 1, "user_name": "nixi", "text": "Build passed"},
             {"is_bot": 0, "user_name": "Kuro", "text": "Nice!"},
         ]
         formatted = batcher._format_messages_for_prompt(messages)  # type: ignore[attr-defined]
         assert "[BOT]" in formatted
-        assert "Toothless" in formatted
+        assert "nixi" in formatted
         assert "Kuro" in formatted
 
     def test_non_bot_messages_not_tagged(self):

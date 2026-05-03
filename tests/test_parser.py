@@ -32,7 +32,7 @@ def sample_channel_log(tmp_path: Path) -> Path:
         [1766780001.123456] @Riya: multi-line
         message continues here
         and here too
-        [1766789999.000001] @Toothless: I'm a bot
+        [1766789999.000001] @nixi: I'm a bot
     """)
     path = tmp_path / "2025-12.log"
     path.write_text(content, encoding="utf-8")
@@ -208,10 +208,8 @@ class TestRawUidAndBot:
         assert parser.is_raw_uid("UABC") is False
 
     def test_is_bot_message_default(self, parser: LogParser):
-        assert parser.is_bot_message("Toothless") is True
+        assert parser.is_bot_message("nixi") is True
         assert parser.is_bot_message("Fixi") is True
-        assert parser.is_bot_message(".OP") is True
-        assert parser.is_bot_message("Cerberus") is True
 
     def test_is_bot_message_normal_user(self, parser: LogParser):
         assert parser.is_bot_message("Jin") is False

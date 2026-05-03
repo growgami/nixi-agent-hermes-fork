@@ -18,6 +18,7 @@ from nixi.intent_classifier import (
     _is_substantive,
     _strip_mentions,
     bot_mentioned_in_text,
+    bot_name_mentioned,
     classify,
     dm_rule,
     greeting_mention_rule,
@@ -752,3 +753,351 @@ class TestEdgeCases:
     def test_strip_mentions_preserves_content(self):
         """_strip_mentions should not alter text with no mentions."""
         assert _strip_mentions("summarize this thread please") == "summarize this thread please"
+
+
+# ---------------------------------------------------------------------------
+# Step 15: TestBotNameMentioned
+# ---------------------------------------------------------------------------
+
+
+class TestBotNameMentioned:
+    """Test bot_name_mentioned: word-boundary matching for natural-language bot names."""
+
+    def test_name_at_word_boundary(self):
+        """Name at word boundary → True."""
+        assert bot_name_mentioned("hey nixi help", ("nixi", "Fixi")) is True
+
+    def test_name_case_insensitive(self):
+        """Matching is case-insensitive."""
+        assert bot_name_mentioned("hey NIXI help", ("nixi", "Fixi")) is True
+        assert bot_name_mentioned("hey fixi help", ("nixi", "Fixi")) is True
+
+    def test_name_not_at_word_boundary(self):
+        """Name embedded in another word → False (no false positive)."""
+        assert bot_name_mentioned("hey nixification", ("nixi", "Fixi")) is False
+
+    def test_name_at_start_of_text(self):
+        """Name at the beginning of text → True (\\b matches start boundary)."""
+        assert bot_name_mentioned("nixi what's up?", ("nixi",)) is True
+
+    def test_name_at_end_of_text(self):
+        """Name at the end of text → True (\\b matches end boundary)."""
+        assert bot_name_mentioned("hey nixi", ("nixi",)) is True
+
+    def test_empty_bot_names(self):
+        """Empty bot_names tuple → False (conservative, no false positives)."""
+        assert bot_name_mentioned("hey nixi", ()) is False
+
+    def test_multiple_names_match(self):
+        """Any name match → True."""
+        assert bot_name_mentioned("hey Fixi help", ("nixi", "Fixi")) is True
+
+    def test_no_matching_name(self):
+        """No name match → False."""
+        assert bot_name_mentioned("hey alexa help", ("nixi", "Fixi")) is False
+
+    def test_name_with_punctuation(self):
+        """Names with punctuation should be escaped and matched at word boundary."""
+        # "fix-bot" as a name should not match "fix-botanical"
+        # But should match the exact name when it's a standalone word
+        assert bot_name_mentioned("hey fix-bot!", ("fix-bot",)) is True
+
+    def test_name_does_not_match_substring(self):
+        """'nix' should not match 'nixi' and vice versa."""
+        assert bot_name_mentioned("hey nixi", ("nix",)) is False
+        assert bot_name_mentioned("hey nix", ("nixi",)) is False
+
+
+# ---------------------------------------------------------------------------
+# Step 16: TestClassificationContextBotNames
+# ---------------------------------------------------------------------------
+
+
+class TestClassificationContextBotNames:
+    """Verify ClassificationContext accepts bot_names field with backward-compatible default."""
+
+    def test_bot_names_default_empty(self):
+        """Default bot_names is empty tuple (backward compatible)."""
+        ctx = ClassificationContext(
+            text="hello",
+            channel="C1",
+            is_dm=False,
+            thread_ts=None,
+            bot_user_id="U1",
+            thread_had_bot=False,
+        )
+        assert ctx.bot_names == ()
+
+    def test_bot_names_explicit_value(self):
+        """bot_names can be set explicitly."""
+        ctx = ClassificationContext(
+            text="hello",
+            channel="C1",
+            is_dm=False,
+            thread_ts=None,
+            bot_user_id="U1",
+            thread_had_bot=False,
+            bot_names=("nixi", "Fixi"),
+        )
+        assert ctx.bot_names == ("nixi", "Fixi")
+
+    def test_frozen_with_bot_names(self):
+        """ClassificationContext remains frozen with bot_names field."""
+        ctx = ClassificationContext(
+            text="hello",
+            channel="C1",
+            is_dm=False,
+            thread_ts=None,
+            bot_user_id="U1",
+            thread_had_bot=False,
+            bot_names=("nixi",),
+        )
+        with pytest.raises(AttributeError):
+            ctx.bot_names = ("other",)  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Step 17: TestSubstantiveMentionRuleWithBotNames
+# ---------------------------------------------------------------------------
+
+
+class TestSubstantiveMentionRuleWithBotNames:
+    """Test substantive_mention_rule recognizes bot_name mentions equivalently to <@USERID> mentions."""
+
+    def test_name_mention_substantive(self):
+        """Bot name mentioned + substantive content → PASS."""
+        ctx = _ctx(text="nixi can you summarize the thread?", bot_user_id=None, bot_names=("nixi",))
+        result = substantive_mention_rule(ctx)
+        assert result is not None
+        assert result.action == "pass"
+        assert result.reason == "substantive_mention"
+
+    def test_name_mention_non_substantive(self):
+        """Bot name mentioned + greeting-only → None (substantive rule doesn't match)."""
+        ctx = _ctx(text="nixi hey", bot_user_id=None, bot_names=("nixi",))
+        result = substantive_mention_rule(ctx)
+        assert result is None
+
+    def test_userid_mention_still_works(self):
+        """<@USERID> mention still works when bot_names is also provided."""
+        ctx = _ctx(text="<@UBOT123> can you summarize the thread?", bot_user_id="UBOT123", bot_names=("nixi",))
+        result = substantive_mention_rule(ctx)
+        assert result is not None
+        assert result.action == "pass"
+
+    def test_either_mention_suffices(self):
+        """Either <@USERID> or bot_name mention triggers the rule."""
+        # Name mention only (no bot_user_id), substantive content with question mark
+        ctx = _ctx(text="nixi what is the status?", bot_user_id=None, bot_names=("nixi",))
+        result = substantive_mention_rule(ctx)
+        assert result is not None
+        assert result.action == "pass"
+
+    def test_no_mention_no_names(self):
+        """No mention and no bot_names → None."""
+        ctx = _ctx(text="summarize the thread", bot_user_id=None, bot_names=())
+        result = substantive_mention_rule(ctx)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Step 18: TestGreetingMentionRuleWithBotNames
+# ---------------------------------------------------------------------------
+
+
+class TestGreetingMentionRuleWithBotNames:
+    """Test greeting_mention_rule recognizes bot_name mentions.
+
+    Note: When the bot name appears as a word in the text (vs. a <@USERID>
+    mention that gets stripped), the name word remains and affects content
+    analysis. "hey nixi" is NOT greeting-only because "nixi" remains after
+    greeting pattern stripping. Only <@USERID> mentions get cleanly stripped.
+    """
+
+    def test_name_mention_with_userid_greeting(self):
+        """Bot name + <@USERID> mention + greeting-only → RESPOND.
+
+        The <@USERID> mention gets stripped, leaving "hey nixi" which may
+        or may not be greeting-only depending on content analysis.
+        This test uses just <@USERID> + greeting which strips cleanly.
+        """
+        ctx = _ctx(text="<@UBOT123> hey", bot_user_id="UBOT123", bot_names=("nixi",))
+        result = greeting_mention_rule(ctx)
+        assert result is not None
+        assert result.action == "respond"
+
+    def test_name_mention_non_greeting(self):
+        """Bot name mentioned + substantive content → None (greeting rule doesn't match)."""
+        ctx = _ctx(text="nixi summarize the thread", bot_user_id=None, bot_names=("nixi",))
+        result = greeting_mention_rule(ctx)
+        assert result is None
+
+    def test_name_mention_with_name_in_text_falls_through(self):
+        """Name-only mention where name stays in text → not greeting-only, falls through.
+
+        "hey nixi" has "nixi" remaining after greeting strip, so it's not
+        greeting-only by the content analysis helpers. The greeting rule
+        returns None, and it falls to later rules.
+        """
+        ctx = _ctx(text="hey nixi", bot_user_id=None, bot_names=("nixi",))
+        result = greeting_mention_rule(ctx)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Step 19: TestNoiseMentionRuleWithBotNames
+# ---------------------------------------------------------------------------
+
+
+class TestNoiseMentionRuleWithBotNames:
+    """Test noise_mention_rule recognizes bot_name mentions.
+
+    Note: When the bot name appears as a word in the text, "nixi thanks!" is
+    NOT acknowledgment-only because "nixi" remains after stripping. The
+    acknowledgment check sees two words and "nixi" is not an acknowledgment.
+    Only <@USERID> mentions get cleanly stripped, leaving pure acknowledgment.
+    """
+
+    def test_userid_with_name_acknowledgment(self):
+        """<@USERID> + acknowledgment triggers noise rule (mention stripped cleanly)."""
+        ctx = _ctx(text="<@UBOT123> thanks!", bot_user_id="UBOT123", bot_names=("nixi",))
+        result = noise_mention_rule(ctx)
+        assert result is not None
+        assert result.action == "drop"
+        assert result.reason == "noise_mention"
+
+    def test_name_mention_substantive_not_noise(self):
+        """Bot name mentioned + substantive content → None (noise rule doesn't match)."""
+        ctx = _ctx(text="nixi check the logs please", bot_user_id=None, bot_names=("nixi",))
+        result = noise_mention_rule(ctx)
+        assert result is None
+
+    def test_userid_mention_still_works(self):
+        """<@USERID> mention + acknowledgment still triggers noise rule."""
+        ctx = _ctx(text="<@UBOT123> lol", bot_user_id="UBOT123", bot_names=("nixi",))
+        result = noise_mention_rule(ctx)
+        assert result is not None
+        assert result.action == "drop"
+
+
+# ---------------------------------------------------------------------------
+# Step 20: TestClassifyIntegrationWithBotNames
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyIntegrationWithBotNames:
+    """Full-flow integration tests for classify() with bot_names."""
+
+    def test_name_mention_substantive_pass(self):
+        """Channel: name mention + substantive → PASS via substantive_mention_rule."""
+        ctx = _ctx(
+            text="nixi can you summarize the thread?",
+            channel="C12345",
+            is_dm=False,
+            bot_user_id=None,
+            bot_names=("nixi", "Fixi"),
+        )
+        result = classify(ctx)
+        assert result.action == "pass"
+        assert result.reason == "substantive_mention"
+
+    def test_name_mention_greeting_falls_through(self):
+        """Channel: name mention where name stays in text → not greeting-only.
+
+        "hey nixi" — "nixi" remains after greeting strip, so not greeting-only.
+        Falls through to unrelated_drop_rule.
+        """
+        ctx = _ctx(
+            text="hey nixi",
+            channel="C12345",
+            is_dm=False,
+            bot_user_id=None,
+            bot_names=("nixi",),
+        )
+        result = classify(ctx)
+        # "nixi" stays in text after greeting strip, so not greeting-only.
+        # Not substantive either. Falls through to DROP.
+        assert result.action == "drop"
+
+    def test_name_mention_noise_falls_through(self):
+        """Channel: name mention where name stays in text → not acknowledgment-only.
+
+        "nixi thanks!" — "nixi" stays in text, not all words are acknowledgments.
+        Falls through to unrelated_drop_rule.
+        """
+        ctx = _ctx(
+            text="nixi thanks!",
+            channel="C12345",
+            is_dm=False,
+            bot_user_id=None,
+            bot_names=("nixi",),
+        )
+        result = classify(ctx)
+        # "nixi" stays in text, not all words are acknowledgments.
+        # Falls through to DROP.
+        assert result.action == "drop"
+
+    def test_name_not_mentioned_drop(self):
+        """Channel: name not in text → DROP via unrelated_drop_rule."""
+        ctx = _ctx(
+            text="anyone seen the deploy?",
+            channel="C12345",
+            is_dm=False,
+            bot_user_id=None,
+            bot_names=("nixi",),
+        )
+        result = classify(ctx)
+        assert result.action == "drop"
+        assert result.reason == "unrelated"
+
+    def test_name_mention_substring_not_matched(self):
+        """Channel: name as substring of another word → DROP (no false positive)."""
+        ctx = _ctx(
+            text="nixification is cool",
+            channel="C12345",
+            is_dm=False,
+            bot_user_id=None,
+            bot_names=("nixi",),
+        )
+        result = classify(ctx)
+        assert result.action == "drop"
+
+    def test_both_userid_and_name_mention(self):
+        """Both <@USERID> and name mention in same message → substantive if content qualifies."""
+        ctx = _ctx(
+            text="<@UBOT123> nixi help please",
+            channel="C12345",
+            is_dm=False,
+            bot_user_id="UBOT123",
+            bot_names=("nixi",),
+        )
+        result = classify(ctx)
+        assert result.action == "pass"
+
+    def test_dm_still_takes_priority(self):
+        """DM still takes priority over name mentions."""
+        ctx = _ctx(
+            text="hey nixi",
+            channel="D12345",
+            is_dm=True,
+            bot_user_id=None,
+            bot_names=("nixi",),
+        )
+        result = classify(ctx)
+        # DM rule fires first. "hey nixi" → _is_greeting_only returns False
+        # because "nixi" remains in text → dm_message (pass), not dm_greeting.
+        assert result.action == "pass"
+        assert result.reason == "dm_message"
+
+    def test_thread_continuation_still_works(self):
+        """Thread continuation still takes priority over name mentions."""
+        ctx = _ctx(
+            text="following up",
+            channel="C12345",
+            is_dm=False,
+            thread_ts="1234567890.001",
+            thread_had_bot=True,
+        )
+        result = classify(ctx)
+        assert result.action == "pass"
+        assert result.reason == "thread_continuation"

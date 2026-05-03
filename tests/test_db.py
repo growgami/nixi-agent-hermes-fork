@@ -161,7 +161,7 @@ class TestInsertMessages:
 
     def test_insert_bot_message(self, conn):
         """Bot messages tagged with is_bot=1."""
-        msg = _make_message(user_name="Toothless", is_bot=True)
+        msg = _make_message(user_name="nixi", is_bot=True)
         insert_messages(conn, [msg])
         cursor = conn.execute("SELECT is_bot FROM scraped_messages")
         assert cursor.fetchone()["is_bot"] == 1

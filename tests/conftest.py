@@ -510,7 +510,7 @@ def sample_log_data(tmp_path):
         "[1766775007.999999] (thread:1766766571.412779) @OG: thread reply here\n"
         "[1766780001.123456] @Riya: multi-line\n"
         "message continues\n"
-        "[1766789999.000001] @Toothless: I'm a bot\n",
+        "[1766789999.000001] @nixi: I'm a bot\n",
         encoding="utf-8",
     )
     return log_file

@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 
-_DEFAULT_BOT_NAMES = ["Fixi", ".OP", "Toothless", "Cerberus"]
+_DEFAULT_BOT_NAMES = ["Fixi", "nixi"]
 
 
 @dataclass

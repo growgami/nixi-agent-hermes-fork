@@ -1,0 +1,24 @@
+_config_version: 22
+model: glm-4.7
+gateway:
+  slack:
+    enabled: true
+    workspace_id: T04JJU19T8B
+  nixi:
+    enabled: true
+    home_channel: C0AE0QVNT1P
+memory:
+  scope: organization
+terminal:
+  backend: local
+  timeout: 180
+nixi:
+  log_dir: ''
+  output_dir: ''
+  extraction_batch_size: 50
+  bot_names:
+  - Fixi
+  - nixi
+  cooccurrence_threshold: 3
+  memory_limit: 10000
+  employee_limit: 1375
