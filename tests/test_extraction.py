@@ -566,6 +566,57 @@ class TestExtractionBatcher:
         late_pos = formatted.find("late")
         assert early_pos < late_pos
 
+    @pytest.mark.asyncio
+    async def test_extract_channel_uses_hermes_home_for_writers(self, nixi_config: NixiConfig, db_conn, hermes_home: Path):
+        """ExtractionBatcher writes to hermes_home paths, not output_dir."""
+        for i in range(25):
+            insert_messages(db_conn, [_make_message(slack_ts=f"1766766571.{i:06d}")])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="## Extracted\n- Test data")
+
+        # Patch get_hermes_home so config.hermes_home property returns our fixture path
+        with patch("nixi.config.get_hermes_home", return_value=hermes_home):
+            batcher = ExtractionBatcher(nixi_config, db_conn, mock_llm)
+            batcher.min_messages = 20
+
+            with patch("nixi.extraction.batch.write_org_facts") as mock_org, \
+                 patch("nixi.extraction.batch.write_rules") as mock_rules, \
+                 patch("nixi.extraction.batch.write_employee_info") as mock_emp, \
+                 patch("nixi.extraction.batch.write_channel_skill") as mock_skill:
+                await batcher.extract_channel("C06M81FSKFF")
+
+                # Verify writers receive hermes_home, not output_dir
+                assert mock_org.call_args[0][1] == batcher.hermes_home
+                assert mock_rules.call_args[0][1] == batcher.hermes_home
+                assert mock_rules.call_args[0][2] == nixi_config.rules_limit
+                assert mock_emp.call_args[0][1] == batcher.hermes_home
+                assert mock_skill.call_args[0][3] == batcher.hermes_home
+
+    def test_collect_existing_employees_reads_from_hermes_home(self, nixi_config: NixiConfig, hermes_home: Path):
+        """_collect_existing_employees reads from hermes_home/employees, not output_dir."""
+        # Pre-create employee data under hermes_home/employees (not output_dir/employees)
+        emp_dir = hermes_home / "employees" / "U_TEST"
+        emp_dir.mkdir(parents=True, exist_ok=True)
+        (emp_dir / "USER.md").write_text("# Test User\nSome info", encoding="utf-8")
+
+        mock_llm = MagicMock()
+        # Patch get_hermes_home so config.hermes_home property returns our fixture path
+        with patch("nixi.config.get_hermes_home", return_value=hermes_home):
+            batcher = ExtractionBatcher(nixi_config, MagicMock(), mock_llm)
+
+            result = batcher._collect_existing_employees()
+            assert "U_TEST" in result
+
+    def test_batcher_stores_hermes_home(self, nixi_config: NixiConfig, hermes_home: Path):
+        """ExtractionBatcher.__init__ captures hermes_home from config."""
+        mock_llm = MagicMock()
+        with patch("nixi.config.get_hermes_home", return_value=hermes_home):
+            batcher = ExtractionBatcher(nixi_config, MagicMock(), mock_llm)
+            assert batcher.hermes_home == hermes_home
+            # output_dir still exists for db operations
+            assert batcher.output_dir == nixi_config.output_dir
+
 
 # ── CLI entrypoint ─────────────────────────────────────────────────────────────
 

@@ -85,6 +85,7 @@ class ExtractionBatcher:
         self.llm = llm
         self.min_messages = min_messages
         self.output_dir = config.output_dir
+        self.hermes_home = config.hermes_home
 
     def _format_messages_for_prompt(self, messages: list[dict[str, Any]]) -> str:
         """Format messages for LLM prompt, prefixing bot messages with [BOT].
@@ -170,7 +171,7 @@ class ExtractionBatcher:
                 memory_limit=self.config.memory_limit,
             )
             org_facts_response = await self.llm.chat(org_facts_prompt)
-            write_org_facts(org_facts_response, self.output_dir, self.config.memory_limit)
+            write_org_facts(org_facts_response, self.hermes_home, self.config.memory_limit)
             extraction_results["org_facts"] = True
         except Exception as e:
             logger.error("Org facts extraction failed for %s: %s", channel_id, e)
@@ -183,7 +184,7 @@ class ExtractionBatcher:
                 memory_limit=self.config.memory_limit,
             )
             rules_response = await self.llm.chat(rules_prompt)
-            write_rules(rules_response, self.output_dir)
+            write_rules(rules_response, self.hermes_home, self.config.rules_limit)
             extraction_results["rules"] = True
         except Exception as e:
             logger.error("Rules extraction failed for %s: %s", channel_id, e)
@@ -201,7 +202,7 @@ class ExtractionBatcher:
             employee_response = await self.llm.chat(employee_prompt)
             employees = self._parse_employee_response(employee_response)
             write_employee_info(
-                employees, self.output_dir, user_map, self.config.employee_limit
+                employees, self.hermes_home, user_map, self.config.employee_limit
             )
             extraction_results["employees"] = len(employees)
         except Exception as e:
@@ -214,7 +215,7 @@ class ExtractionBatcher:
             skill_response = await self.llm.chat(skill_prompt)
             skills = self._parse_skill_response(skill_response)
             for skill in skills:
-                write_channel_skill(skill, channel_id, date_str, self.output_dir)
+                write_channel_skill(skill, channel_id, date_str, self.hermes_home)
             extraction_results["skills"] = len(skills)
         except Exception as e:
             logger.error("Channel skill extraction failed for %s: %s", channel_id, e)
@@ -274,7 +275,7 @@ class ExtractionBatcher:
         Returns:
             JSON string of existing employee data, or empty string.
         """
-        employees_dir = self.output_dir / "employees"
+        employees_dir = self.hermes_home / "employees"
         if not employees_dir.is_dir():
             return "[]"
 
