@@ -19,6 +19,7 @@ from agent.prompt_builder import (
     CONTEXT_FILE_MAX_CHARS,
     _load_agents_md,
     _load_nixi_context,
+    _strip_nixi_generated,
     build_context_files_prompt,
     load_soul_md,
 )
@@ -160,6 +161,66 @@ class TestLoadNixiContextSecurity:
 
         # Total result should include truncation marker
         assert "truncated" in result.lower()
+
+
+# ── _strip_nixi_generated direct tests ─────────────────────────────────────────
+
+
+class TestStripNixiGenerated:
+    """Direct tests for _strip_nixi_generated() helper."""
+
+    def test_empty_string_returns_empty(self) -> None:
+        assert _strip_nixi_generated("") == ""
+
+    def test_no_h2_headers_returns_passthrough(self) -> None:
+        """Content with no ## headers passes through unchanged."""
+        content = "# Title\n\nSome prose here.\n\nMore text.\n"
+        assert _strip_nixi_generated(content) == content
+
+    def test_only_nixi_sections_returns_empty(self) -> None:
+        """Content that is entirely nixi-generated returns empty string."""
+        content = "## Extracted 2025-04-01 12:00 UTC\n\nRule A.\n\n## Extracted 2025-05-01 12:00 UTC\n\nRule B.\n"
+        assert _strip_nixi_generated(content) == ""
+
+    def test_mixed_sections_strips_nixi_keeps_human(self) -> None:
+        """Human ## sections kept, nixi ## Extracted sections stripped."""
+        content = (
+            "## Human Section\n\nImportant info.\n\n"
+            "## Extracted 2025-04-01 12:00 UTC\n\nNixi rule.\n\n"
+            "## Another Human Section\n\nMore info.\n"
+        )
+        result = _strip_nixi_generated(content)
+        assert "Human Section" in result
+        assert "Important info." in result
+        assert "Another Human Section" in result
+        assert "More info." in result
+        assert "Extracted 2025-04-01" not in result
+        assert "Nixi rule" not in result
+
+    def test_prose_before_sections_preserved(self) -> None:
+        """Lines before any ## header are preserved even when nixi sections exist."""
+        content = (
+            "Some preamble text.\n\n"
+            "## Extracted 2025-03-01 08:00 UTC\n\nOld rule.\n"
+        )
+        result = _strip_nixi_generated(content)
+        assert "Some preamble text" in result
+        assert "Extracted 2025-03-01" not in result
+
+    def test_h1_header_preserved_with_nixi_sections(self) -> None:
+        """# headers (##-one) are preserved even when only nixi ## sections exist."""
+        content = (
+            "# Project\n\n"
+            "## Extracted 2025-04-01 10:00 UTC\n\nAuto-generated.\n"
+        )
+        result = _strip_nixi_generated(content)
+        assert "# Project" in result
+        assert "Extracted 2025-04-01" not in result
+
+    def test_no_nixi_sections_passthrough(self) -> None:
+        """Content with only human ## sections passes through unchanged."""
+        content = "## Dev Guide\n\nUse linting.\n\n## Security\n\nNo secrets.\n"
+        assert _strip_nixi_generated(content) == content
 
 
 # ── _load_agents_md nixi detection ────────────────────────────────────────────

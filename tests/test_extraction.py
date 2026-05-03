@@ -262,6 +262,27 @@ class TestWriteRules:
         result = _consolidate_rules(text, 10000)
         assert result.startswith("# RULES")
 
+    def test_consolidation_text_without_extracted_sections(self):
+        """_consolidate_rules handles text with no ## Extracted sections."""
+        text = "# RULES\n\nSome content without timestamps\n"
+        result = _consolidate_rules(text, 10000)
+        # No ## Extracted sections — preamble contains all content
+        assert result.startswith("# RULES")
+        assert "Some content without timestamps" in result
+
+    def test_consolidation_single_section(self):
+        """_consolidate_rules preserves a single ## Extracted section within limit."""
+        text = "# RULES\n\n## Extracted 2026-01-15 10:00 UTC\n\nRule one.\n"
+        result = _consolidate_rules(text, 10000)
+        assert "Rule one" in result
+        assert result.startswith("# RULES")
+
+    def test_consolidation_empty_rules_file(self):
+        """_consolidate_rules handles minimal # RULES header only."""
+        text = "# RULES\n"
+        result = _consolidate_rules(text, 10000)
+        assert result.startswith("# RULES")
+
     def test_safe_path_rejects_traversal_in_rules(self, hermes_home: Path):
         """write_rules rejects path traversal via hermes_home."""
         from nixi.path_validator import safe_path
@@ -405,6 +426,21 @@ class TestWriteChannelSkill:
         from nixi.path_validator import safe_path
         with pytest.raises(PathTraversalError):
             safe_path(hermes_home, "skills/channel/../../../etc/passwd")
+
+    def test_write_channel_skill_rejects_malicious_channel_id(self, hermes_home: Path):
+        """write_channel_skill raises PathTraversalError for traversal channel IDs.
+        
+        The channel_id is embedded in skills/channel/{channel_id}/... so a
+        traversal pattern like ../../../../etc escapes hermes_home.
+        """
+        skill = {
+            "skill_name": "test-skill",
+            "triggers": ["test"],
+            "procedure": "Step 1",
+            "pitfalls": "None",
+        }
+        with pytest.raises(PathTraversalError):
+            write_channel_skill(skill, "../../../../../etc", "2026-04-26", hermes_home)
 
 
 # ── Extraction log tracking ────────────────────────────────────────────────────
