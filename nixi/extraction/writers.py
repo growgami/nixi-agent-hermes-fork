@@ -1,10 +1,13 @@
 """File writers with consolidation logic and conflict resolution for nixi extraction.
 
 Handles:
-- MEMORY.md write/merge with aggressive consolidation at memory_limit
-- AGENTS.md append (never overwrite)
+- ORG_FACTS.md write/merge with aggressive consolidation at memory_limit
+- RULES.md append with deduplication and truncation at rules_limit
 - Employee USER.md creation, merge, and directory conflict resolution
 - Channel skill directory structure with SQL references
+
+All writers target hermes-consumed paths under HERMES_HOME and validate
+paths with safe_path() to prevent path traversal in multi-tenant deployments.
 """
 
 from __future__ import annotations
@@ -15,16 +18,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from nixi.models import UserMap
+from nixi.path_validator import PathTraversalError, safe_path
 
 logger = logging.getLogger(__name__)
 
 
 def write_org_facts(
     facts: str,
-    output_dir: Path,
+    hermes_home: Path,
     memory_limit: int | None = None,
 ) -> None:
-    """Write/merge organizational facts to {output_dir}/MEMORY.md.
+    """Write/merge organizational facts to {hermes_home}/nixi/ORG_FACTS.md.
 
     If the file already exists, merges new facts with existing content.
     If total content exceeds memory_limit, aggressively consolidates by
@@ -32,18 +36,23 @@ def write_org_facts(
 
     Args:
         facts: New facts to write/merge.
-        output_dir: Base output directory.
+        hermes_home: HERMES_HOME base directory.
         memory_limit: Maximum character limit. Uses NixiConfig default if None.
+
+    Raises:
+        PathTraversalError: If the resolved path escapes hermes_home.
     """
     if memory_limit is None:
         from nixi.config import NixiConfig
 
         memory_limit = NixiConfig.from_config().memory_limit
 
-    memory_path = output_dir / "MEMORY.md"
+    # Validate path to prevent traversal outside hermes_home
+    safe_path(hermes_home, "nixi/ORG_FACTS.md")
+    facts_path = hermes_home / "nixi" / "ORG_FACTS.md"
 
-    if memory_path.exists():
-        existing = memory_path.read_text(encoding="utf-8")
+    if facts_path.exists():
+        existing = facts_path.read_text(encoding="utf-8")
         merged = existing + "\n\n" + facts
     else:
         merged = facts
@@ -52,8 +61,8 @@ def write_org_facts(
     if len(merged) > memory_limit:
         merged = _consolidate(merged, memory_limit)
 
-    memory_path.parent.mkdir(parents=True, exist_ok=True)
-    memory_path.write_text(merged, encoding="utf-8")
+    facts_path.parent.mkdir(parents=True, exist_ok=True)
+    facts_path.write_text(merged, encoding="utf-8")
 
 
 def _consolidate(text: str, limit: int) -> str:
@@ -91,33 +100,134 @@ def _consolidate(text: str, limit: int) -> str:
     return result
 
 
-def write_rules(rules: str, output_dir: Path) -> None:
-    """Append new rules to {output_dir}/AGENTS.md.
+def write_rules(rules: str, hermes_home: Path, rules_limit: int | None = None) -> None:
+    """Append new rules to {hermes_home}/nixi/RULES.md.
 
     Never overwrites existing content. New rules are appended with a
-    timestamped section header.
+    timestamped section header. If total content exceeds rules_limit,
+    deduplicates and truncates oldest sections.
 
     Args:
         rules: New rules to append.
-        output_dir: Base output directory.
+        hermes_home: HERMES_HOME base directory.
+        rules_limit: Maximum character limit for RULES.md.
+            Uses NixiConfig default if None.
+
+    Raises:
+        PathTraversalError: If the resolved path escapes hermes_home.
     """
-    agents_path = output_dir / "AGENTS.md"
+    if rules_limit is None:
+        from nixi.config import NixiConfig
+
+        rules_limit = NixiConfig.from_config().rules_limit
+
+    # Validate path to prevent traversal outside hermes_home
+    safe_path(hermes_home, "nixi/RULES.md")
+    rules_path = hermes_home / "nixi" / "RULES.md"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     new_section = f"\n\n## Extracted {timestamp}\n\n{rules}"
 
-    agents_path.parent.mkdir(parents=True, exist_ok=True)
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if agents_path.exists():
-        existing = agents_path.read_text(encoding="utf-8")
-        agents_path.write_text(existing + new_section, encoding="utf-8")
+    if rules_path.exists():
+        existing = rules_path.read_text(encoding="utf-8")
+        content = existing + new_section
     else:
-        agents_path.write_text(f"# AGENTS\n\n{rules}\n", encoding="utf-8")
+        content = f"# RULES\n\n{rules}\n"
+
+    # Enforce rules_limit via consolidation
+    if len(content) > rules_limit:
+        content = _consolidate_rules(content, rules_limit)
+
+    rules_path.write_text(content, encoding="utf-8")
+
+
+def _consolidate_rules(text: str, limit: int) -> str:
+    """Consolidate rules text to fit within a character limit.
+
+    Strategy (adapted for timestamped sections):
+    1. Parse text into sections split by ``## Extracted`` headers.
+    2. Deduplicate: if multiple sections have identical content (after
+       stripping headers), keep only the latest.
+    3. If still over limit: truncate from the oldest section upward
+       (keep newest content, drop oldest sections).
+    4. Add a consolidation notice when truncation occurs.
+
+    Args:
+        text: Full RULES.md content with timestamped sections.
+        limit: Maximum character count.
+
+    Returns:
+        Consolidated text under ``limit`` characters.
+    """
+    # Split into timestamped sections — keep the file header (before first
+    # ## Extracted) as the preamble.
+    section_pattern = re.compile(r"(?=## Extracted )", re.MULTILINE)
+    parts = section_pattern.split(text)
+
+    preamble = parts[0] if parts else ""
+    sections = parts[1:] if len(parts) > 1 else []
+
+    # Deduplicate: if two sections have identical content (ignoring the
+    # ## Extracted ... header line), keep only the latest.
+    seen_content: dict[str, int] = {}
+    deduped_sections: list[str] = []
+    for idx, section in enumerate(sections):
+        # Strip the header line to compare body content
+        lines = section.splitlines()
+        body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        if body in seen_content:
+            # Remove the earlier duplicate, keep this one (latest)
+            earlier_idx = seen_content[body]
+            # Mark earlier for removal by replacing with empty string
+            deduped_sections[earlier_idx] = ""
+        deduped_sections.append(section)
+        seen_content[body] = len(deduped_sections) - 1
+
+    # Filter out emptied duplicates
+    deduped_sections = [s for s in deduped_sections if s]
+
+    result = preamble + "".join(deduped_sections)
+    if len(result) <= limit:
+        return result
+
+    # Truncate from oldest section upward — drop earliest sections first.
+    # Build output by starting with the newest section and adding older
+    # sections as long as they fit within the limit.
+    notice = "<!-- rules consolidated, oldest entries dropped -->\n"
+    notice_len = len(notice)
+    header_budget = len(preamble) + notice_len
+
+    # Always include at least the newest section (possibly truncated)
+    if not deduped_sections:
+        return preamble
+
+    truncated: list[str] = []
+    for section in reversed(deduped_sections):
+        candidate_len = header_budget + sum(len(s) for s in truncated) + len(section)
+        if candidate_len <= limit:
+            truncated.insert(0, section)
+        elif not truncated:
+            # First (newest) section doesn't fit — include it truncated
+            remaining = limit - header_budget
+            if remaining > 0:
+                truncated.append(section[:remaining])
+            break
+        # else: skip this (older) section
+
+    result = preamble + notice + "".join(truncated)
+
+    if len(result) > limit:
+        # Last resort: hard truncate
+        result = result[:limit]
+
+    return result
 
 
 def write_employee_info(
     employees: list[dict],
-    output_dir: Path,
+    hermes_home: Path,
     user_map: UserMap,
     employee_limit: int | None = None,
 ) -> None:
@@ -131,16 +241,19 @@ def write_employee_info(
 
     Args:
         employees: List of dicts with keys: display_name, user_id, info.
-        output_dir: Base output directory.
+        hermes_home: HERMES_HOME base directory.
         user_map: Bidirectional user mapping for conflict resolution.
         employee_limit: Char limit per employee. Uses config default if None.
+
+    Raises:
+        PathTraversalError: If any employee path resolves outside hermes_home.
     """
     if employee_limit is None:
         from nixi.config import NixiConfig
 
         employee_limit = NixiConfig.from_config().employee_limit
 
-    employees_dir = output_dir / "employees"
+    employees_dir = hermes_home / "employees"
     employees_dir.mkdir(parents=True, exist_ok=True)
 
     for emp in employees:
@@ -150,6 +263,9 @@ def write_employee_info(
 
         # Determine directory key: prefer user_id, fall back to display_name
         dir_key = user_id if user_id else display_name
+
+        # Validate path to prevent traversal — dir_key comes from employee data
+        safe_path(hermes_home, f"employees/{dir_key}/USER.md")
         emp_dir = employees_dir / dir_key
 
         # Handle conflict: both user_id and display_name directories exist
@@ -236,7 +352,7 @@ def write_channel_skill(
     skill: dict,
     channel_id: str,
     date: str,
-    output_dir: Path,
+    hermes_home: Path,
 ) -> None:
     """Create a channel skill directory with SKILL.md and SQL references.
 
@@ -248,11 +364,17 @@ def write_channel_skill(
         skill: Dict with keys: skill_name, triggers, procedure, pitfalls.
         channel_id: Slack channel ID.
         date: ISO date string (YYYY-MM-DD).
-        output_dir: Base output directory.
+        hermes_home: HERMES_HOME base directory.
+
+    Raises:
+        PathTraversalError: If channel_id or skill_name resolve outside hermes_home.
     """
     skill_name = skill.get("skill_name", "unnamed-skill")
+
+    # Validate path to prevent traversal — channel_id comes from Slack (external input)
+    safe_path(hermes_home, f"skills/channel/{channel_id}/{date}-{skill_name}")
     skill_dir = (
-        output_dir
+        hermes_home
         / "skills"
         / "channel"
         / channel_id

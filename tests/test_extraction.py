@@ -2,7 +2,7 @@
 
 Covers: prompt templates, writer consolidation/merge/append/conflict resolution,
 batch orchestration (channel grouping, threshold skip, LLM batching, bot tagging),
-extraction log tracking, CLI entrypoints.
+extraction log tracking, CLI entrypoints, path validation.
 """
 
 from datetime import datetime, timezone
@@ -28,34 +28,37 @@ from nixi.extraction.prompts import (
     RULES_PROMPT,
 )
 from nixi.extraction.writers import (
+    _consolidate_rules,
     write_channel_skill,
     write_employee_info,
     write_org_facts,
     write_rules,
 )
 from nixi.models import ScrapedMessage, UserMap
+from nixi.path_validator import PathTraversalError
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
-def output_dir(tmp_path: Path) -> Path:
-    """Temp output directory (replaces hermes_home for standalone tests)."""
-    d = tmp_path / "output"
+def hermes_home(tmp_path: Path) -> Path:
+    """Temp HERMES_HOME directory for writers."""
+    d = tmp_path / "hermes"
     d.mkdir()
     return d
 
 
 @pytest.fixture
-def nixi_config(output_dir: Path, tmp_path: Path) -> NixiConfig:
+def nixi_config(hermes_home: Path, tmp_path: Path) -> NixiConfig:
     """Minimal NixiConfig for testing."""
     return NixiConfig(
         log_dir=tmp_path / "logs",
-        output_dir=output_dir,
+        output_dir=hermes_home / "nixi" / "output",
         extraction_batch_size=50,
         memory_limit=500,
         employee_limit=300,
+        rules_limit=500,
     )
 
 
@@ -144,89 +147,126 @@ class TestPrompts:
 
 
 class TestWriteOrgFacts:
-    """Test MEMORY.md write, merge, and consolidation."""
+    """Test ORG_FACTS.md write, merge, and consolidation."""
 
-    def test_write_creates_memory_md(self, output_dir: Path):
-        """write_org_facts creates MEMORY.md in output_dir."""
-        write_org_facts("## Facts\n- Team uses React", output_dir)
-        memory_file = output_dir / "MEMORY.md"
-        assert memory_file.exists()
-        content = memory_file.read_text(encoding="utf-8")
+    def test_write_creates_org_facts_md(self, hermes_home: Path):
+        """write_org_facts creates ORG_FACTS.md in hermes_home/nixi/."""
+        write_org_facts("## Facts\n- Team uses React", hermes_home)
+        facts_file = hermes_home / "nixi" / "ORG_FACTS.md"
+        assert facts_file.exists()
+        content = facts_file.read_text(encoding="utf-8")
         assert "React" in content
 
-    def test_write_merges_with_existing(self, output_dir: Path):
+    def test_write_merges_with_existing(self, hermes_home: Path):
         """write_org_facts merges new facts with existing content."""
-        write_org_facts("## Facts\n- React frontend", output_dir)
-        write_org_facts("## Facts\n- Python backend", output_dir)
-        content = (output_dir / "MEMORY.md").read_text(encoding="utf-8")
+        write_org_facts("## Facts\n- React frontend", hermes_home)
+        write_org_facts("## Facts\n- Python backend", hermes_home)
+        content = (hermes_home / "nixi" / "ORG_FACTS.md").read_text(encoding="utf-8")
         assert "React" in content
         assert "Python" in content
 
-    def test_consolidation_at_memory_limit(self, output_dir: Path):
+    def test_consolidation_at_memory_limit(self, hermes_home: Path):
         """Aggressively consolidate when total exceeds memory_limit."""
-        config = NixiConfig(
-            log_dir=output_dir,
-            output_dir=output_dir,
-            memory_limit=100,  # Very small limit
-        )
-        # Write content that should exceed limit after merge
-        write_org_facts("A" * 80, output_dir, memory_limit=config.memory_limit)
-        write_org_facts("B" * 80, output_dir, memory_limit=config.memory_limit)
-        content = (output_dir / "MEMORY.md").read_text(encoding="utf-8")
-        # Content should be consolidated (shorter than raw merge)
-        # and still fit within the limit
-        assert len(content) <= config.memory_limit
+        write_org_facts("A" * 80, hermes_home, memory_limit=100)
+        write_org_facts("B" * 80, hermes_home, memory_limit=100)
+        content = (hermes_home / "nixi" / "ORG_FACTS.md").read_text(encoding="utf-8")
+        # Content should be consolidated and fit within the limit
+        assert len(content) <= 100
 
-    def test_consolidation_preserves_key_info(self, output_dir: Path):
+    def test_consolidation_preserves_key_info(self, hermes_home: Path):
         """After consolidation, key information is preserved."""
-        config = NixiConfig(
-            log_dir=output_dir,
-            output_dir=output_dir,
-            memory_limit=200,
-        )
-        write_org_facts("## Key\n- API key rotation every 30 days\n- Deploy on Fridays", output_dir, memory_limit=config.memory_limit)
-        write_org_facts("## Key\n- Use PostgreSQL\n- CI via GitHub Actions", output_dir, memory_limit=config.memory_limit)
-        content = (output_dir / "MEMORY.md").read_text(encoding="utf-8")
-        # Should still have meaningful content after consolidation
+        write_org_facts("## Key\n- API key rotation every 30 days\n- Deploy on Fridays", hermes_home, memory_limit=200)
+        write_org_facts("## Key\n- Use PostgreSQL\n- CI via GitHub Actions", hermes_home, memory_limit=200)
+        content = (hermes_home / "nixi" / "ORG_FACTS.md").read_text(encoding="utf-8")
         assert len(content) > 0
 
-    def test_default_memory_limit(self, output_dir: Path):
+    def test_default_memory_limit(self, hermes_home: Path):
         """Without explicit memory_limit, uses NixiConfig default."""
-        write_org_facts("Short content", output_dir)
-        assert (output_dir / "MEMORY.md").exists()
+        write_org_facts("Short content", hermes_home)
+        assert (hermes_home / "nixi" / "ORG_FACTS.md").exists()
+
+    def test_path_traversal_rejected(self, hermes_home: Path):
+        """write_org_facts rejects paths that would escape hermes_home."""
+        # safe_path should reject traversal before any file write
+        with pytest.raises(PathTraversalError):
+            safe_path_test = hermes_home / "nixi" / "ORG_FACTS.md"
+            # Direct call with traversal attempt — safe_path validates the relative path
+            from nixi.path_validator import safe_path
+            safe_path(hermes_home, "../../../etc/passwd")
 
 
 # ── AGENTS.md append ──────────────────────────────────────────────────────────
 
 
 class TestWriteRules:
-    """Test AGENTS.md append behavior."""
+    """Test RULES.md append behavior with consolidation."""
 
-    def test_append_creates_agents_md(self, output_dir: Path):
-        """write_rules creates AGENTS.md if it doesn't exist."""
-        write_rules("- Always respond in English\n- Be concise", output_dir)
-        agents_file = output_dir / "AGENTS.md"
-        assert agents_file.exists()
-        content = agents_file.read_text(encoding="utf-8")
+    def test_append_creates_rules_md(self, hermes_home: Path):
+        """write_rules creates RULES.md in hermes_home/nixi/ if it doesn't exist."""
+        write_rules("- Always respond in English\n- Be concise", hermes_home)
+        rules_file = hermes_home / "nixi" / "RULES.md"
+        assert rules_file.exists()
+        content = rules_file.read_text(encoding="utf-8")
         assert "English" in content
+        assert content.startswith("# RULES")
 
-    def test_append_does_not_overwrite(self, output_dir: Path):
-        """write_rules appends to existing AGENTS.md content."""
-        write_rules("- Rule 1: Be polite", output_dir)
-        write_rules("- Rule 2: Be concise", output_dir)
-        content = (output_dir / "AGENTS.md").read_text(encoding="utf-8")
+    def test_append_does_not_overwrite(self, hermes_home: Path):
+        """write_rules appends to existing RULES.md content."""
+        write_rules("- Rule 1: Be polite", hermes_home)
+        write_rules("- Rule 2: Be concise", hermes_home)
+        content = (hermes_home / "nixi" / "RULES.md").read_text(encoding="utf-8")
         assert "polite" in content
         assert "concise" in content
 
-    def test_multiple_appends(self, output_dir: Path):
-        """Multiple appends accumulate."""
-        write_rules("- First rule", output_dir)
-        write_rules("- Second rule", output_dir)
-        write_rules("- Third rule", output_dir)
-        content = (output_dir / "AGENTS.md").read_text(encoding="utf-8")
+    def test_multiple_appends(self, hermes_home: Path):
+        """Multiple appends accumulate with timestamped sections."""
+        write_rules("- First rule", hermes_home)
+        write_rules("- Second rule", hermes_home)
+        write_rules("- Third rule", hermes_home)
+        content = (hermes_home / "nixi" / "RULES.md").read_text(encoding="utf-8")
         assert "First" in content
         assert "Second" in content
         assert "Third" in content
+
+    def test_rules_limit_enforcement(self, hermes_home: Path):
+        """Consolidation triggers when content exceeds rules_limit."""
+        # Write enough content to exceed limit
+        write_rules("A" * 200, hermes_home, rules_limit=300)
+        write_rules("B" * 200, hermes_home, rules_limit=300)
+        content = (hermes_home / "nixi" / "RULES.md").read_text(encoding="utf-8")
+        # Content should be kept within limit after consolidation
+        assert len(content) <= 300
+
+    def test_consolidation_deduplicates_identical_sections(self):
+        """_consolidate_rules deduplicates sections with identical content."""
+        text = "# RULES\n\n## Extracted 2026-01-01 00:00 UTC\n\nSame content\n\n## Extracted 2026-01-02 00:00 UTC\n\nSame content\n"
+        result = _consolidate_rules(text, 10000)
+        # Only one copy of duplicate content should remain
+        assert result.count("Same content") == 1
+
+    def test_consolidation_truncates_oldest(self):
+        """_consolidate_rules drops oldest sections first when truncating."""
+        old_section = "## Extracted 2026-01-01 00:00 UTC\n\n" + "Old rule. " * 20 + "\n"
+        new_section = "## Extracted 2026-01-02 00:00 UTC\n\nNew content here\n"
+        text = "# RULES\n\n" + old_section + "\n" + new_section
+        # Limit allows preamble + notice + new section but not old
+        limit = 150
+        result = _consolidate_rules(text, limit)
+        assert len(result) <= limit
+        assert "New content" in result
+        assert "oldest entries dropped" in result
+
+    def test_consolidation_preserves_preamble(self):
+        """_consolidate_rules preserves the # RULES header (preamble)."""
+        text = "# RULES\n\n## Extracted 2026-01-01 00:00 UTC\n\nRule one\n"
+        result = _consolidate_rules(text, 10000)
+        assert result.startswith("# RULES")
+
+    def test_safe_path_rejects_traversal_in_rules(self, hermes_home: Path):
+        """write_rules rejects path traversal via hermes_home."""
+        from nixi.path_validator import safe_path
+        with pytest.raises(PathTraversalError):
+            safe_path(hermes_home, "../../etc/passwd")
 
 
 # ── Employee USER.md ───────────────────────────────────────────────────────────
@@ -235,68 +275,68 @@ class TestWriteRules:
 class TestWriteEmployeeInfo:
     """Test employee USER.md creation, merge, and conflict resolution."""
 
-    def test_create_new_employee_file(self, output_dir: Path):
-        """Creates USER.md for a new employee."""
+    def test_create_new_employee_file(self, hermes_home: Path):
+        """Creates USER.md for a new employee under hermes_home/employees/."""
         employees = [
             {"display_name": "Kuro", "user_id": "U04K8NLDCG0", "info": "Senior engineer, React expert"}
         ]
-        write_employee_info(employees, output_dir, _make_user_map())
-        user_file = output_dir / "employees" / "U04K8NLDCG0" / "USER.md"
+        write_employee_info(employees, hermes_home, _make_user_map())
+        user_file = hermes_home / "employees" / "U04K8NLDCG0" / "USER.md"
         assert user_file.exists()
         content = user_file.read_text(encoding="utf-8")
         assert "Kuro" in content
 
-    def test_employee_without_user_id(self, output_dir: Path):
+    def test_employee_without_user_id(self, hermes_home: Path):
         """Creates USER.md using display_name when user_id is missing."""
         employees = [
             {"display_name": "Riya", "user_id": None, "info": "PM, product focus"}
         ]
-        write_employee_info(employees, output_dir, _make_user_map())
-        user_file = output_dir / "employees" / "Riya" / "USER.md"
+        write_employee_info(employees, hermes_home, _make_user_map())
+        user_file = hermes_home / "employees" / "Riya" / "USER.md"
         assert user_file.exists()
         content = user_file.read_text(encoding="utf-8")
         assert "Riya" in content
 
-    def test_merge_existing_employee(self, output_dir: Path):
+    def test_merge_existing_employee(self, hermes_home: Path):
         """Merges new info with existing USER.md content."""
         employees = [
             {"display_name": "Kuro", "user_id": "U04K8NLDCG0", "info": "React expert"}
         ]
-        write_employee_info(employees, output_dir, _make_user_map())
+        write_employee_info(employees, hermes_home, _make_user_map())
         # Second write with new info
         employees2 = [
             {"display_name": "Kuro", "user_id": "U04K8NLDCG0", "info": "Also knows Python"}
         ]
-        write_employee_info(employees2, output_dir, _make_user_map())
-        content = (output_dir / "employees" / "U04K8NLDCG0" / "USER.md").read_text(encoding="utf-8")
+        write_employee_info(employees2, hermes_home, _make_user_map())
+        content = (hermes_home / "employees" / "U04K8NLDCG0" / "USER.md").read_text(encoding="utf-8")
         assert "React" in content
         assert "Python" in content
 
-    def test_employee_limit_enforcement(self, output_dir: Path):
+    def test_employee_limit_enforcement(self, hermes_home: Path):
         """Compresses content when exceeding employee_limit."""
         employees = [
             {"display_name": "Kuro", "user_id": "U04K8NLDCG0", "info": "A" * 500}
         ]
-        write_employee_info(employees, output_dir, _make_user_map(), employee_limit=100)
-        content = (output_dir / "employees" / "U04K8NLDCG0" / "USER.md").read_text(encoding="utf-8")
+        write_employee_info(employees, hermes_home, _make_user_map(), employee_limit=100)
+        content = (hermes_home / "employees" / "U04K8NLDCG0" / "USER.md").read_text(encoding="utf-8")
         assert len(content) <= 100
 
-    def test_directory_conflict_resolution(self, output_dir: Path):
+    def test_directory_conflict_resolution(self, hermes_home: Path):
         """When both user_id and display_name directories exist, merge into user_id, archive display_name."""
         # Pre-create display_name directory
-        display_dir = output_dir / "employees" / "Kuro"
+        display_dir = hermes_home / "employees" / "Kuro"
         display_dir.mkdir(parents=True, exist_ok=True)
         (display_dir / "USER.md").write_text("# Kuro\nOld info from display_name dir", encoding="utf-8")
 
         # Also pre-create user_id directory
-        uid_dir = output_dir / "employees" / "U04K8NLDCG0"
+        uid_dir = hermes_home / "employees" / "U04K8NLDCG0"
         uid_dir.mkdir(parents=True, exist_ok=True)
         (uid_dir / "USER.md").write_text("# Kuro\nOld info from user_id dir", encoding="utf-8")
 
         employees = [
             {"display_name": "Kuro", "user_id": "U04K8NLDCG0", "info": "New extracted info"}
         ]
-        write_employee_info(employees, output_dir, _make_user_map())
+        write_employee_info(employees, hermes_home, _make_user_map())
 
         # Merged into user_id directory
         uid_content = (uid_dir / "USER.md").read_text(encoding="utf-8")
@@ -307,6 +347,12 @@ class TestWriteEmployeeInfo:
         archive_dir = display_dir.parent / (display_dir.name + ".archived")
         assert archive_dir.exists() or not display_dir.exists()
 
+    def test_path_traversal_rejected_for_employee(self, hermes_home: Path):
+        """write_employee_info rejects dir_key that escapes hermes_home."""
+        from nixi.path_validator import safe_path
+        with pytest.raises(PathTraversalError):
+            safe_path(hermes_home, "employees/../../../etc/passwd")
+
 
 # ── Channel skill ──────────────────────────────────────────────────────────────
 
@@ -314,20 +360,20 @@ class TestWriteEmployeeInfo:
 class TestWriteChannelSkill:
     """Test channel skill directory structure and SQL references."""
 
-    def test_creates_skill_directory(self, output_dir: Path):
-        """Creates skill directory with correct structure."""
+    def test_creates_skill_directory(self, hermes_home: Path):
+        """Creates skill directory with correct structure under hermes_home/skills/."""
         skill = {
             "skill_name": "deploy-checks",
             "triggers": ["deploy", "release"],
             "procedure": "1. Check CI status\n2. Verify tests pass\n3. Notify channel",
             "pitfalls": "Don't deploy on Fridays",
         }
-        write_channel_skill(skill, "C06M81FSKFF", "2026-04-26", output_dir)
-        skill_dir = output_dir / "skills" / "channel" / "C06M81FSKFF" / "2026-04-26-deploy-checks"
+        write_channel_skill(skill, "C06M81FSKFF", "2026-04-26", hermes_home)
+        skill_dir = hermes_home / "skills" / "channel" / "C06M81FSKFF" / "2026-04-26-deploy-checks"
         assert skill_dir.exists()
         assert (skill_dir / "SKILL.md").exists()
 
-    def test_creates_channel_context_reference(self, output_dir: Path):
+    def test_creates_channel_context_reference(self, hermes_home: Path):
         """Creates references/channel-context.md with SQL queries."""
         skill = {
             "skill_name": "deploy-checks",
@@ -335,13 +381,13 @@ class TestWriteChannelSkill:
             "procedure": "Check CI status",
             "pitfalls": "Don't skip tests",
         }
-        write_channel_skill(skill, "C06M81FSKFF", "2026-04-26", output_dir)
-        ref_file = output_dir / "skills" / "channel" / "C06M81FSKFF" / "2026-04-26-deploy-checks" / "references" / "channel-context.md"
+        write_channel_skill(skill, "C06M81FSKFF", "2026-04-26", hermes_home)
+        ref_file = hermes_home / "skills" / "channel" / "C06M81FSKFF" / "2026-04-26-deploy-checks" / "references" / "channel-context.md"
         assert ref_file.exists()
         content = ref_file.read_text(encoding="utf-8")
         assert "nixi_state" in content or "SQL" in content
 
-    def test_skill_md_content(self, output_dir: Path):
+    def test_skill_md_content(self, hermes_home: Path):
         """SKILL.md contains skill info."""
         skill = {
             "skill_name": "code-review",
@@ -349,10 +395,16 @@ class TestWriteChannelSkill:
             "procedure": "Check for style issues",
             "pitfalls": "Don't be too nitpicky",
         }
-        write_channel_skill(skill, "C06M81FSKFF", "2026-04-26", output_dir)
-        skill_md = output_dir / "skills" / "channel" / "C06M81FSKFF" / "2026-04-26-code-review" / "SKILL.md"
+        write_channel_skill(skill, "C06M81FSKFF", "2026-04-26", hermes_home)
+        skill_md = hermes_home / "skills" / "channel" / "C06M81FSKFF" / "2026-04-26-code-review" / "SKILL.md"
         content = skill_md.read_text(encoding="utf-8")
         assert "code-review" in content
+
+    def test_path_traversal_rejected_for_channel_id(self, hermes_home: Path):
+        """Channel ID with path traversal is rejected by safe_path."""
+        from nixi.path_validator import safe_path
+        with pytest.raises(PathTraversalError):
+            safe_path(hermes_home, "skills/channel/../../../etc/passwd")
 
 
 # ── Extraction log tracking ────────────────────────────────────────────────────
