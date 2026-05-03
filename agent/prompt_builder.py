@@ -985,7 +985,13 @@ def _load_hermes_md(cwd_path: Path) -> str:
 
 
 def _load_agents_md(cwd_path: Path) -> str:
-    """AGENTS.md — top-level only (no recursive walk)."""
+    """AGENTS.md — top-level only (no recursive walk).
+
+    Detects and strips nixi-generated ``## Extracted YYYY-MM-DD`` sections
+    to prevent duplicate injection when an old ``nixi/AGENTS.md`` exists
+    alongside the new ``HERMES_HOME/nixi/RULES.md``.  If the file contains
+    *only* nixi-generated sections, returns ``""``.
+    """
     for name in ["AGENTS.md", "agents.md"]:
         candidate = cwd_path / name
         if candidate.exists():
@@ -993,11 +999,108 @@ def _load_agents_md(cwd_path: Path) -> str:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
                     content = _scan_context_content(content, name)
+                    content = _strip_nixi_generated(content)
+                    if not content:
+                        return ""
                     result = f"## {name}\n\n{content}"
                     return _truncate_content(result, "AGENTS.md")
             except Exception as e:
                 logger.debug("Could not read %s: %s", candidate, e)
     return ""
+
+
+# Pattern matching nixi-generated section headers like "## Extracted 2025-04-10 12:00 UTC"
+_NIXI_EXTRACTED_HEADER_RE = re.compile(r"^## Extracted \d{4}-\d{2}-\d{2}", re.MULTILINE)
+
+
+def _strip_nixi_generated(content: str) -> str:
+    """Remove nixi-generated ``## Extracted …`` sections from *content*.
+
+    If *content* consists entirely of nixi-generated sections (every ``##``
+    header matches ``## Extracted YYYY-MM-DD``), returns ``""``.
+
+    Non-section content (``# Title``, prose before any ``##`` header, etc.)
+    is preserved.  Only the lines between ``## Extracted`` headers are stripped.
+    """
+    # Split content into sections by ## headers. We need to identify which
+    # sections are nixi-generated and which are human-authored.
+    lines = content.splitlines()
+    kept_lines: list[str] = []
+    in_nixi_section = False
+    has_nixi_sections = False
+    has_non_nixi_content = False
+
+    # Track file-level content (lines before any ## header)
+    seen_h2 = False
+
+    for line in lines:
+        if _NIXI_EXTRACTED_HEADER_RE.match(line):
+            in_nixi_section = True
+            has_nixi_sections = True
+            seen_h2 = True
+            continue  # skip the header line itself
+
+        if line.startswith("## ") and not _NIXI_EXTRACTED_HEADER_RE.match(line):
+            # Non-nixi ## header — end any open nixi section
+            in_nixi_section = False
+            seen_h2 = True
+            kept_lines.append(line)
+            has_non_nixi_content = True
+            continue
+
+        if in_nixi_section:
+            # Content within a nixi-generated section — skip
+            continue
+
+        # Non-section content or content within a human-authored section
+        kept_lines.append(line)
+        if line.strip():
+            has_non_nixi_content = True
+
+    if not has_nixi_sections:
+        return content
+
+    if not has_non_nixi_content:
+        return ""
+
+    result = "\n".join(kept_lines).strip()
+    return result
+
+
+def _load_nixi_context() -> str:
+    """Load org facts and rules from HERMES_HOME/nixi/ into the prompt.
+
+    Reads two files independently:
+      - ``HERMES_HOME/nixi/ORG_FACTS.md``
+      - ``HERMES_HOME/nixi/RULES.md``
+
+    Each is scanned for injection threats and truncated at
+    ``CONTEXT_FILE_MAX_CHARS``.  Returns ``""`` when neither file exists.
+
+    Directory creation is NOT the responsibility of this function —
+    the nixi extraction writers create the ``nixi/`` directory on first write.
+    """
+    hermes_home = get_hermes_home()
+    nixi_dir = hermes_home / "nixi"
+    sections: list[str] = []
+
+    for filename in ("ORG_FACTS.md", "RULES.md"):
+        filepath = nixi_dir / filename
+        if not filepath.exists():
+            continue
+        try:
+            content = filepath.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            content = _scan_context_content(content, filename)
+            content = _truncate_content(content, filename)
+            sections.append(f"## {filename}\n\n{content}")
+        except Exception as e:
+            logger.debug("Could not read %s: %s", filepath, e)
+
+    if not sections:
+        return ""
+    return "\n\n".join(sections)
 
 
 def _load_claude_md(cwd_path: Path) -> str:
@@ -1082,6 +1185,13 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
         soul_content = load_soul_md()
         if soul_content:
             sections.append(soul_content)
+
+    # Nixi-extracted org facts and rules from HERMES_HOME/nixi/
+    # Always loaded (independent of project context priority chain).
+    # Placed after SOUL.md so identity comes before extracted knowledge.
+    nixi_context = _load_nixi_context()
+    if nixi_context:
+        sections.append(nixi_context)
 
     if not sections:
         return ""
