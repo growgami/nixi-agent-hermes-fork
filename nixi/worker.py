@@ -8,14 +8,41 @@ Provides async entrypoints that combine ingest + extract:
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Any
+
+from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_constants import get_hermes_home
 
 from nixi.adapter import LogFileAdapter
 from nixi.config import NixiConfig
 from nixi.db import ensure_schema, get_connection
+from nixi.discovery import discover_hermes_home
 from nixi.extraction.batch import ExtractionBatcher, LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_hermes_env() -> Path:
+    """Resolve HERMES_HOME and load dotenv for programmatic entry points.
+
+    If HERMES_HOME is already set in the environment, keeps it.
+    Otherwise resolves via discover_hermes_home() or get_hermes_home() fallback.
+    Always calls load_hermes_dotenv() with both hermes_home and project_env.
+
+    Returns:
+        The resolved HERMES_HOME path.
+    """
+    if os.environ.get("HERMES_HOME"):
+        resolved = Path(os.environ["HERMES_HOME"])
+    else:
+        resolved = discover_hermes_home() or get_hermes_home()
+        os.environ["HERMES_HOME"] = str(resolved)
+
+    project_env = Path(__file__).resolve().parents[1] / ".env"
+    load_hermes_dotenv(hermes_home=resolved, project_env=project_env)
+    return resolved
 
 
 def _check_db_populated(conn) -> bool:
@@ -47,6 +74,8 @@ async def run(
     Returns:
         Dict with ingest and extract summaries.
     """
+    _ensure_hermes_env()
+
     if config is None:
         try:
             config = NixiConfig.from_config()
@@ -124,6 +153,8 @@ async def run_channel(
     Returns:
         Dict with ingest and extract summaries for the channel.
     """
+    _ensure_hermes_env()
+
     if config is None:
         try:
             config = NixiConfig.from_config()

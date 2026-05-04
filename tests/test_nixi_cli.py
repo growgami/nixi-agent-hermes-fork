@@ -1,10 +1,12 @@
 """Tests for nixi CLI entrypoints and worker orchestration.
 
 Covers: click commands (ingest, extract, run), options (--force, --dry-run,
---channel), worker.run / worker.run_channel orchestration,
+--channel, --hermes-home), HERMES_HOME resolution chain, dotenv loading,
+worker.run / worker.run_channel orchestration,
 empty DB guard, ensure_schema at startup.
 """
 
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -433,3 +435,282 @@ class TestWorker:
             assert "ingest" in result
             assert "extract" in result
             assert result["ingest"]["inserted"] == 80
+
+
+# ── HERMES_HOME resolution and --hermes-home option ───────────────────────────
+
+
+class TestHermesHomeOption:
+    """Test --hermes-home CLI option and HERMES_HOME resolution chain.
+
+    Note: CliRunner.isolation() restores os.environ after invoke(), so we
+    verify resolution via mock call assertions rather than os.environ checks.
+    """
+
+    def test_hermes_home_flag_sets_resolved_path(self, runner: CliRunner, tmp_path: Path, monkeypatch):
+        """--hermes-home flag resolves to the provided path."""
+        hermes_home = tmp_path / "custom-home"
+        hermes_home.mkdir()
+
+        with patch("nixi.cli.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.ingest.run_ingestion", new_callable=AsyncMock) as mock_ingest:
+            mock_ingest.return_value = {
+                "total_lines": 0, "parsed": 0, "inserted": 0,
+                "already_existing": 0, "bots_tagged": 0,
+                "threads_linked": 0, "raw_uid_posters": 0,
+            }
+            result = runner.invoke(main, [
+                "--hermes-home", str(hermes_home), "ingest",
+            ])
+            assert result.exit_code == 0, f"CLI failed: {result.output}"
+            # Verify load_hermes_dotenv called with the flag-provided path
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == Path(str(hermes_home))
+            # discover_hermes_home and get_hermes_home should NOT be called
+            # because the flag takes priority
+
+    def test_hermes_home_flag_overrides_env_var(self, runner: CliRunner, tmp_path: Path, monkeypatch):
+        """--hermes-home flag overrides existing HERMES_HOME env var in resolution."""
+        new_path = tmp_path / "new-home"
+        new_path.mkdir()
+        monkeypatch.setenv("HERMES_HOME", "/old/path")
+
+        with patch("nixi.cli.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.cli.discover_hermes_home") as mock_discover, \
+             patch("nixi.ingest.run_ingestion", new_callable=AsyncMock) as mock_ingest:
+            mock_ingest.return_value = {
+                "total_lines": 0, "parsed": 0, "inserted": 0,
+                "already_existing": 0, "bots_tagged": 0,
+                "threads_linked": 0, "raw_uid_posters": 0,
+            }
+            result = runner.invoke(main, [
+                "--hermes-home", str(new_path), "ingest",
+            ])
+            assert result.exit_code == 0, f"CLI failed: {result.output}"
+            # Flag value should be used, not env var
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == Path(str(new_path))
+            # discover_hermes_home should NOT be called (flag takes priority)
+            mock_discover.assert_not_called()
+
+    def test_discovers_hermes_home_when_no_flag_no_env(self, runner: CliRunner, tmp_path: Path, monkeypatch):
+        """When no --hermes-home flag and no HERMES_HOME env var, discovery function is called."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        discovered_path = tmp_path / "discovered"
+
+        with patch("nixi.cli.discover_hermes_home", return_value=discovered_path) as mock_discover, \
+             patch("nixi.cli.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.ingest.run_ingestion", new_callable=AsyncMock) as mock_ingest:
+            mock_ingest.return_value = {
+                "total_lines": 0, "parsed": 0, "inserted": 0,
+                "already_existing": 0, "bots_tagged": 0,
+                "threads_linked": 0, "raw_uid_posters": 0,
+            }
+            result = runner.invoke(main, ["ingest"])
+            assert result.exit_code == 0, f"CLI failed: {result.output}"
+            mock_discover.assert_called_once()
+            # Verify the discovered path was passed to load_hermes_dotenv
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == discovered_path
+
+    def test_falls_back_to_get_hermes_home_when_nothing_found(self, runner: CliRunner, tmp_path: Path, monkeypatch):
+        """When no flag, no env var, and discovery returns None, falls back to get_hermes_home()."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        fallback_home = tmp_path / ".hermes"
+        fallback_home.mkdir()
+
+        with patch("nixi.cli.discover_hermes_home", return_value=None), \
+             patch("nixi.cli.get_hermes_home", return_value=fallback_home) as mock_get, \
+             patch("nixi.cli.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.ingest.run_ingestion", new_callable=AsyncMock) as mock_ingest:
+            mock_ingest.return_value = {
+                "total_lines": 0, "parsed": 0, "inserted": 0,
+                "already_existing": 0, "bots_tagged": 0,
+                "threads_linked": 0, "raw_uid_posters": 0,
+            }
+            result = runner.invoke(main, ["ingest"])
+            assert result.exit_code == 0, f"CLI failed: {result.output}"
+            mock_get.assert_called_once()
+            # Verify the fallback path was passed to load_hermes_dotenv
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == fallback_home
+
+    def test_load_hermes_dotenv_called_with_resolved_path(self, runner: CliRunner, tmp_path: Path, monkeypatch):
+        """load_hermes_dotenv() is called with resolved hermes_home and project_env."""
+        hermes_home = tmp_path / "resolved-home"
+        hermes_home.mkdir()
+
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        with patch("nixi.cli.discover_hermes_home", return_value=hermes_home), \
+             patch("nixi.cli.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.ingest.run_ingestion", new_callable=AsyncMock) as mock_ingest:
+            mock_ingest.return_value = {
+                "total_lines": 0, "parsed": 0, "inserted": 0,
+                "already_existing": 0, "bots_tagged": 0,
+                "threads_linked": 0, "raw_uid_posters": 0,
+            }
+            result = runner.invoke(main, ["ingest"])
+            assert result.exit_code == 0, f"CLI failed: {result.output}"
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == hermes_home
+            # project_env should end with .env in the nixi-agent root
+            assert str(call_kwargs["project_env"]).endswith(".env")
+
+    def test_existing_env_var_used_when_no_flag(self, runner: CliRunner, tmp_path: Path, monkeypatch):
+        """When HERMES_HOME already set in env and no --hermes-home flag, env var value is used."""
+        existing_home = tmp_path / "existing-home"
+        existing_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(existing_home))
+
+        with patch("nixi.cli.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.cli.discover_hermes_home") as mock_discover, \
+             patch("nixi.ingest.run_ingestion", new_callable=AsyncMock) as mock_ingest:
+            mock_ingest.return_value = {
+                "total_lines": 0, "parsed": 0, "inserted": 0,
+                "already_existing": 0, "bots_tagged": 0,
+                "threads_linked": 0, "raw_uid_posters": 0,
+            }
+            result = runner.invoke(main, ["ingest"])
+            assert result.exit_code == 0, f"CLI failed: {result.output}"
+            # discover should NOT be called (env var takes priority)
+            mock_discover.assert_not_called()
+            # Verify the existing env var path is passed to load_hermes_dotenv
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == existing_home
+
+
+class TestWorkerHermesHome:
+    """Test worker._ensure_hermes_env() resolves HERMES_HOME for programmatic path."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_hermes_env_sets_missing_hermes_home(self, tmp_path: Path, monkeypatch):
+        """_ensure_hermes_env() resolves and sets HERMES_HOME when not in environ."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        discovered = tmp_path / "discovered-home"
+
+        with patch("nixi.worker.discover_hermes_home", return_value=discovered), \
+             patch("nixi.worker.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.worker.ensure_schema"), \
+             patch("nixi.worker.LogFileAdapter") as MockAdapter, \
+             patch("nixi.worker.ExtractionBatcher") as MockBatcher, \
+             patch("nixi.worker.LLMClient"), \
+             patch("nixi.worker.get_connection") as mock_get_conn, \
+             patch("nixi.worker._check_db_populated", return_value=True):
+            MockAdapter.return_value.ingest.return_value = MagicMock(
+                total_lines=0, parsed=0, bots_tagged=0,
+                threads_linked=0, inserted=0, already_existing=0,
+                raw_uid_posters=0,
+            )
+            mock_conn = MagicMock()
+            mock_get_conn.return_value = mock_conn
+            MockBatcher.return_value.extract_all = AsyncMock(return_value={
+                "channels": {}, "total_extracted": 0, "total_skipped": 0,
+            })
+
+            from nixi.worker import run
+            config = NixiConfig(
+                log_dir=tmp_path / "logs",
+                output_dir=tmp_path / "output",
+            )
+            (tmp_path / "logs").mkdir(exist_ok=True)
+            (tmp_path / "output").mkdir(exist_ok=True)
+
+            await run(config)
+
+            assert os.environ.get("HERMES_HOME") == str(discovered)
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == discovered
+
+    @pytest.mark.asyncio
+    async def test_ensure_hermes_env_preserves_existing(self, tmp_path: Path, monkeypatch):
+        """_ensure_hermes_env() keeps existing HERMES_HOME and still loads dotenv."""
+        existing_home = tmp_path / "existing"
+        existing_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(existing_home))
+
+        with patch("nixi.worker.discover_hermes_home") as mock_discover, \
+             patch("nixi.worker.load_hermes_dotenv") as mock_dotenv, \
+             patch("nixi.worker.ensure_schema"), \
+             patch("nixi.worker.LogFileAdapter") as MockAdapter, \
+             patch("nixi.worker.ExtractionBatcher") as MockBatcher, \
+             patch("nixi.worker.LLMClient"), \
+             patch("nixi.worker.get_connection") as mock_get_conn, \
+             patch("nixi.worker._check_db_populated", return_value=True):
+            MockAdapter.return_value.ingest.return_value = MagicMock(
+                total_lines=0, parsed=0, bots_tagged=0,
+                threads_linked=0, inserted=0, already_existing=0,
+                raw_uid_posters=0,
+            )
+            mock_conn = MagicMock()
+            mock_get_conn.return_value = mock_conn
+            MockBatcher.return_value.extract_all = AsyncMock(return_value={
+                "channels": {}, "total_extracted": 0, "total_skipped": 0,
+            })
+
+            from nixi.worker import run
+            config = NixiConfig(
+                log_dir=tmp_path / "logs",
+                output_dir=tmp_path / "output",
+            )
+            (tmp_path / "logs").mkdir(exist_ok=True)
+            (tmp_path / "output").mkdir(exist_ok=True)
+
+            await run(config)
+
+            # Should NOT call discover since HERMES_HOME already set
+            mock_discover.assert_not_called()
+            assert os.environ.get("HERMES_HOME") == str(existing_home)
+            mock_dotenv.assert_called_once()
+            call_kwargs = mock_dotenv.call_args[1]
+            assert call_kwargs["hermes_home"] == existing_home
+
+    @pytest.mark.asyncio
+    async def test_ensure_hermes_env_falls_back_to_get_hermes_home(self, tmp_path: Path, monkeypatch):
+        """_ensure_hermes_env() falls back to get_hermes_home() when discovery returns None."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        fallback_home = tmp_path / ".hermes"
+        fallback_home.mkdir()
+
+        with patch("nixi.worker.discover_hermes_home", return_value=None), \
+             patch("nixi.worker.get_hermes_home", return_value=fallback_home), \
+             patch("nixi.worker.load_hermes_dotenv"), \
+             patch("nixi.worker.ensure_schema"), \
+             patch("nixi.worker.LogFileAdapter") as MockAdapter, \
+             patch("nixi.worker.ExtractionBatcher") as MockBatcher, \
+             patch("nixi.worker.LLMClient"), \
+             patch("nixi.worker.get_connection") as mock_get_conn, \
+             patch("nixi.worker._check_db_populated", return_value=True):
+            MockAdapter.return_value.ingest.return_value = MagicMock(
+                total_lines=0, parsed=0, bots_tagged=0,
+                threads_linked=0, inserted=0, already_existing=0,
+                raw_uid_posters=0,
+            )
+            mock_conn = MagicMock()
+            mock_get_conn.return_value = mock_conn
+            MockBatcher.return_value.extract_all = AsyncMock(return_value={
+                "channels": {}, "total_extracted": 0, "total_skipped": 0,
+            })
+
+            from nixi.worker import run
+            config = NixiConfig(
+                log_dir=tmp_path / "logs",
+                output_dir=tmp_path / "output",
+            )
+            (tmp_path / "logs").mkdir(exist_ok=True)
+            (tmp_path / "output").mkdir(exist_ok=True)
+
+            await run(config)
+
+            assert os.environ.get("HERMES_HOME") == str(fallback_home)

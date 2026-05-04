@@ -7,19 +7,47 @@ Subcommands:
 """
 
 import asyncio
+import os
 from pathlib import Path
 
 import click
 from rich.console import Console
 
+from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_constants import get_hermes_home
 from nixi.config import NixiConfig
+from nixi.discovery import discover_hermes_home
 
 console = Console()
 
 
 @click.group()
-def main() -> None:
+@click.option(
+    "--hermes-home",
+    type=click.Path(),
+    default=None,
+    help="Path to HERMES_HOME directory (overrides env var and auto-discovery)",
+)
+@click.pass_context
+def main(ctx: click.Context, hermes_home: str | None) -> None:
     """Nixi — Slack log extraction pipeline."""
+    # Resolve HERMES_HOME using priority chain:
+    # 1. --hermes-home flag (if provided)
+    # 2. os.environ.get("HERMES_HOME") (existing env var)
+    # 3. discover_hermes_home() (CWD-walk discovery)
+    # 4. get_hermes_home() (defaults to ~/.hermes)
+    if hermes_home:
+        resolved = Path(hermes_home)
+    elif os.environ.get("HERMES_HOME"):
+        resolved = Path(os.environ["HERMES_HOME"])
+    else:
+        resolved = discover_hermes_home() or get_hermes_home()
+
+    os.environ["HERMES_HOME"] = str(resolved)
+
+    # Load API keys from both HERMES_HOME/.env and project root .env
+    project_env = Path(__file__).resolve().parents[1] / ".env"
+    load_hermes_dotenv(hermes_home=resolved, project_env=project_env)
 
 
 @main.command()
