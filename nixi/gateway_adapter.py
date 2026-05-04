@@ -48,6 +48,7 @@ from nixi.intent_classifier import (
     bot_name_mentioned,
     classify,
 )
+from nixi.protocols import NOHELLO_PROTOCOL
 
 logger = logging.getLogger(__name__)
 
@@ -371,8 +372,8 @@ class NixiAdapter(BasePlatformAdapter):
     ) -> None:
         """Extract Slack event fields, classify intent, and dispatch accordingly.
 
-        Classification determines whether to DROP (discard), RESPOND (send
-        direct reply without LLM), or PASS (continue to overlay load + LLM).
+        Classification determines whether to DROP (discard) or PASS (continue
+        to overlay load + LLM with NOHELLO_PROTOCOL injected).
         """
         # Extract Slack event fields from the payload
         # Sludge sends the full Slack event envelope; the relevant fields
@@ -471,22 +472,16 @@ class NixiAdapter(BasePlatformAdapter):
             )
             return
 
-        if result.action == "respond":
-            logger.info(
-                "[nixi] Responding directly: reason=%s user=%s channel=%s",
-                result.reason,
-                user_id,
-                channel,
-            )
-            # For DMs, channel is the DM channel ID (e.g. "D12345").
-            # For channels, channel is the channel ID (e.g. "C12345").
-            send_chat_id = channel or f"nixi:{user_id}"
-            await self.send(send_chat_id, result.response_text, reply_to=thread_ts)
-            return
-
         # PASS: continue to overlay load + LLM
         # Load employee overlay for ephemeral context injection (cached)
         overlay = self._get_overlay_with_cache(user_id)
+
+        # Build channel_prompt: always include NOHELLO_PROTOCOL,
+        # prepend employee overlay if present.
+        if overlay:
+            channel_prompt = f"{overlay}\n\n{NOHELLO_PROTOCOL}"
+        else:
+            channel_prompt = NOHELLO_PROTOCOL
 
         # Build session key and source
         chat_id = channel or f"nixi:{user_id}"
@@ -505,7 +500,7 @@ class NixiAdapter(BasePlatformAdapter):
             source=source,
             raw_message=event_data,
             message_id=event_ts or None,
-            channel_prompt=overlay if overlay else None,
+            channel_prompt=channel_prompt,
         )
 
         logger.info(
