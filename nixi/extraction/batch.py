@@ -18,6 +18,8 @@ from agent.auxiliary_client import resolve_provider_client
 from nixi.config import NixiConfig
 from nixi.db import (
     build_user_map,
+    get_realtime_unprocessed,
+    get_realtime_unprocessed_channels,
     get_unprocessed,
     get_unprocessed_channels,
     mark_extracted,
@@ -96,6 +98,7 @@ class ExtractionBatcher:
         conn: Any,
         llm: Any,
         min_messages: int = 20,
+        source: str = "scraped",
     ) -> None:
         self.config = config
         self.conn = conn
@@ -103,16 +106,31 @@ class ExtractionBatcher:
         self.min_messages = min_messages
         self.output_dir = config.output_dir
         self.hermes_home = config.hermes_home
+        if source not in ("scraped", "realtime"):
+            raise ValueError(f"source must be 'scraped' or 'realtime', got '{source}'")
+        self.source = source
 
-    def _format_messages_for_prompt(self, messages: list[dict[str, Any]]) -> str:
+    def _format_messages_for_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        channel_type: str | None = None,
+    ) -> str:
         """Format messages for LLM prompt, prefixing bot messages with [BOT].
 
         Messages are sorted by timestamp (oldest first) and formatted as:
             [BOT] @name: text  (for bot messages)
             @name: text        (for regular messages)
 
+        When channel_type is provided (realtime source), a header line
+        is prepended with the channel context (e.g. "[Channel type: group]").
+
+        For realtime messages without user_name, user_id is used as fallback.
+
         Args:
-            messages: List of message dicts from get_unprocessed().
+            messages: List of message dicts from get_unprocessed() or
+                get_realtime_unprocessed().
+            channel_type: Optional channel type context (e.g. "channel",
+                "group", "im", "mpim") from realtime_messages.
 
         Returns:
             Formatted string for LLM prompt.
@@ -121,8 +139,12 @@ class ExtractionBatcher:
         sorted_msgs = sorted(messages, key=lambda m: m.get("timestamp", ""))
 
         lines: list[str] = []
+        if channel_type:
+            lines.append(f"[Channel type: {channel_type}]")
+
         for msg in sorted_msgs:
-            name = msg.get("user_name", "unknown")
+            # Realtime messages may not have user_name; fall back to user_id
+            name = msg.get("user_name") or msg.get("user_id") or "unknown"
             text = msg.get("text", "")
             is_bot = bool(msg.get("is_bot", 0))
 
@@ -147,9 +169,14 @@ class ExtractionBatcher:
         Returns:
             Dict with extraction results (channel_id, message_count, skipped, etc.)
         """
-        messages = get_unprocessed(
-            self.conn, channel_id, limit=self.config.extraction_batch_size
-        )
+        if self.source == "realtime":
+            messages = get_realtime_unprocessed(
+                self.conn, channel_id, limit=self.config.extraction_batch_size
+            )
+        else:
+            messages = get_unprocessed(
+                self.conn, channel_id, limit=self.config.extraction_batch_size
+            )
 
         # Skip channels with insufficient signal
         if len(messages) < self.min_messages:
@@ -169,8 +196,11 @@ class ExtractionBatcher:
         # Build user map for employee resolution
         user_map = build_user_map(self.conn, self.config.cooccurrence_threshold)
 
-        # Format messages for prompt
-        formatted = self._format_messages_for_prompt(messages)
+        # Format messages for prompt (include channel_type context for realtime source)
+        channel_type = None
+        if self.source == "realtime" and messages:
+            channel_type = messages[0].get("channel_type")
+        formatted = self._format_messages_for_prompt(messages, channel_type=channel_type)
         batch_id = str(uuid.uuid4())[:8]
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -256,7 +286,10 @@ class ExtractionBatcher:
         Returns:
             Dict with per-channel results and aggregate summary.
         """
-        channels = get_unprocessed_channels(self.conn)
+        if self.source == "realtime":
+            channels = get_realtime_unprocessed_channels(self.conn)
+        else:
+            channels = get_unprocessed_channels(self.conn)
         logger.info("Found %d channels with unprocessed messages", len(channels))
 
         results: dict[str, Any] = {

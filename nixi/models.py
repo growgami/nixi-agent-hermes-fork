@@ -122,6 +122,43 @@ class IngestionResult:
 
 
 @dataclass
+class RealtimeMessage:
+    """A message from the realtime Socket Mode storage pipeline.
+
+    Stored in the realtime_messages table by the Go ingester. The Python
+    extraction pipeline reads from this table (never writes to it).
+
+    Attributes:
+        slack_ts: Slack timestamp (e.g. "1766766571.412779").
+        channel_id: Channel ID (e.g. "C06M81FSKFF").
+        user_id: Slack user ID. Nullable — bot/system messages may lack this.
+        text: Message text.
+        thread_ts: Thread timestamp (for thread replies).
+        parent_ts: Parent message timestamp (for thread replies).
+        is_bot: Whether the poster is a bot.
+        channel_type: Slack channel type (e.g. "channel", "group", "im", "mpim").
+            Nullable — not available in scraped_messages.
+        event_id: Socket Mode event ID — unique per delivery.
+        client_msg_id: Client-generated message ID. Nullable.
+        team_id: Slack workspace/team ID. Nullable.
+        timestamp: ISO datetime string.
+    """
+
+    slack_ts: str
+    channel_id: str
+    user_id: str | None
+    text: str
+    thread_ts: str | None
+    parent_ts: str | None
+    is_bot: bool
+    channel_type: str | None
+    event_id: str
+    client_msg_id: str | None
+    team_id: str | None
+    timestamp: str
+
+
+@dataclass
 class UserMap:
     """Bidirectional user name ↔ ID mapping.
 

@@ -36,6 +36,86 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def ensure_realtime_schema(db_path: Path | None = None) -> None:
+    """Execute schema_realtime.sql DDL to create realtime_messages table.
+
+    Creates the realtime_messages table and indexes if they don't exist.
+    Does NOT create scraped_messages or nixi_extraction_log — call
+    ensure_schema() separately for those.
+
+    Args:
+        db_path: Path to nixi_state.db. Defaults to NixiConfig.db_path.
+    """
+    if db_path is None:
+        from nixi.config import NixiConfig
+
+        db_path = NixiConfig.from_config().db_path
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    schema_path = Path(__file__).parent / "schemas" / "schema_realtime.sql"
+    schema_sql = schema_path.read_text(encoding="utf-8")
+
+    conn = get_connection(db_path)
+    try:
+        conn.executescript(schema_sql)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_realtime_unprocessed(
+    conn: sqlite3.Connection,
+    channel_id: str,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Select realtime messages not yet extracted for a given channel.
+
+    Returns messages from realtime_messages where channel_id matches AND
+    NOT EXISTS in nixi_extraction_log, ordered by timestamp ASC.
+    Shares the same nixi_extraction_log table with scraped_messages —
+    a message extracted from one source won't be re-extracted from the other.
+
+    Args:
+        conn: Active SQLite connection.
+        channel_id: Channel ID to query.
+        limit: Maximum messages to return.
+
+    Returns:
+        List of message dicts from realtime_messages.
+    """
+    cursor = conn.execute(
+        """SELECT * FROM realtime_messages
+           WHERE channel_id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM nixi_extraction_log
+               WHERE nixi_extraction_log.channel_id = realtime_messages.channel_id
+                 AND nixi_extraction_log.slack_ts = realtime_messages.slack_ts
+             )
+           ORDER BY timestamp ASC
+           LIMIT ?""",
+        (channel_id, limit),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_realtime_unprocessed_channels(conn: sqlite3.Connection) -> list[str]:
+    """SELECT DISTINCT channel_ids from realtime_messages with no extraction log entries.
+
+    Returns:
+        List of channel_id strings.
+    """
+    cursor = conn.execute(
+        """SELECT DISTINCT channel_id FROM realtime_messages
+           WHERE NOT EXISTS (
+               SELECT 1 FROM nixi_extraction_log
+               WHERE nixi_extraction_log.channel_id = realtime_messages.channel_id
+                 AND nixi_extraction_log.slack_ts = realtime_messages.slack_ts
+           )"""
+    )
+    return [row["channel_id"] for row in cursor.fetchall()]
+
+
 def ensure_schema(db_path: Path | None = None) -> None:
     """Execute schema.sql DDL to create tables and indexes if they don't exist.
 

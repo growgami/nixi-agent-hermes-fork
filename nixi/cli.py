@@ -145,6 +145,55 @@ def extract(
             console.print(f"  [green]✓[/] Extracted: [bold]{extracted}[/] channels | Skipped: {skipped}")
 
 
+@main.command(name="realtime-extract")
+@click.option("--channel", type=str, default=None, help="Single channel ID to extract")
+@click.option("--output-dir", type=click.Path(), default=None, help="Path to output directory")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be extracted without LLM calls")
+def realtime_extract(
+    channel: str | None,
+    output_dir: str | None,
+    dry_run: bool,
+) -> None:
+    """Run LLM extraction on realtime messages.
+
+    Extracts organizational memory from realtime_messages table
+    (populated by the Go ingester from Socket Mode events).
+
+    Use --channel to limit extraction to a single channel.
+    Use --dry-run to show what would be extracted without making LLM calls.
+    """
+    from nixi.extract import run_extraction_realtime, run_extraction_realtime_channel
+
+    label = f"channel {channel}" if channel else "all channels"
+    if dry_run:
+        console.print(f"[bold blue]nixi realtime-extract[/] — {label} [dim](dry-run)[/]")
+    else:
+        console.print(f"[bold blue]nixi realtime-extract[/] — {label}")
+
+    if output_dir:
+        config = NixiConfig(
+            log_dir=Path(),
+            output_dir=Path(output_dir),
+        )
+    else:
+        config = None
+
+    if channel:
+        result = asyncio.run(run_extraction_realtime_channel(channel, config, dry_run=dry_run))
+    else:
+        result = asyncio.run(run_extraction_realtime(config, dry_run=dry_run))
+
+    if result:
+        if result.get("status") == "empty_db":
+            console.print("[yellow]⚠ No realtime messages found. Ensure the ingester is running.[/]")
+        elif result.get("status") == "dry_run":
+            console.print("[dim]Dry run complete — no LLM calls made.[/]")
+        else:
+            extracted = result.get("total_extracted", 0)
+            skipped = result.get("total_skipped", 0)
+            console.print(f"  [green]✓[/] Extracted: [bold]{extracted}[/] channels | Skipped: {skipped}")
+
+
 @main.command()
 @click.option("--log-dir", type=click.Path(), default=None, help="Path to slack_logs directory")
 @click.option("--output-dir", type=click.Path(), default=None, help="Path to output directory")

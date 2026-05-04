@@ -13,8 +13,11 @@ import pytest
 
 from nixi.config import NixiConfig
 from nixi.db import (
+    ensure_realtime_schema,
     ensure_schema,
     get_connection,
+    get_realtime_unprocessed,
+    get_realtime_unprocessed_channels,
     get_unprocessed,
     get_unprocessed_channels,
     insert_messages,
@@ -857,3 +860,161 @@ class TestLLMClient:
         with patch("nixi.extraction.batch.resolve_provider_client", return_value=(None, None)):
             with pytest.raises(RuntimeError, match="/custom/hermes/home"):
                 LLMClient(config)
+
+
+# ── Realtime source extraction ────────────────────────────────────────────────
+
+
+class TestExtractionBatcherRealtimeSource:
+    """Test ExtractionBatcher with source='realtime' routing."""
+
+    def test_source_validation_rejects_invalid(self, nixi_config: NixiConfig):
+        """ExtractionBatcher raises ValueError for invalid source."""
+        with pytest.raises(ValueError, match="source must be 'scraped' or 'realtime'"):
+            ExtractionBatcher(nixi_config, MagicMock(), MagicMock(), source="invalid")
+
+    def test_source_validation_accepts_scraped(self, nixi_config: NixiConfig):
+        """ExtractionBatcher accepts source='scraped'."""
+        batcher = ExtractionBatcher(nixi_config, MagicMock(), MagicMock(), source="scraped")
+        assert batcher.source == "scraped"
+
+    def test_source_validation_accepts_realtime(self, nixi_config: NixiConfig):
+        """ExtractionBatcher accepts source='realtime'."""
+        batcher = ExtractionBatcher(nixi_config, MagicMock(), MagicMock(), source="realtime")
+        assert batcher.source == "realtime"
+
+    def test_source_defaults_to_scraped(self, nixi_config: NixiConfig):
+        """ExtractionBatcher defaults to source='scraped'."""
+        batcher = ExtractionBatcher(nixi_config, MagicMock(), MagicMock())
+        assert batcher.source == "scraped"
+
+    def test_format_messages_includes_channel_type_for_realtime(self):
+        """_format_messages_for_prompt includes [Channel type: group] header for realtime."""
+        batcher = ExtractionBatcher.__new__(ExtractionBatcher)
+        messages = [
+            {"timestamp": "2026-04-26T01:00:00", "user_id": "U123", "text": "hello", "is_bot": 0},
+        ]
+        formatted = batcher._format_messages_for_prompt(messages, channel_type="group")
+        assert "[Channel type: group]" in formatted
+        assert "@U123: hello" in formatted
+
+    def test_format_messages_omits_channel_type_when_none(self):
+        """_format_messages_for_prompt omits channel_type header when None."""
+        batcher = ExtractionBatcher.__new__(ExtractionBatcher)
+        messages = [
+            {"timestamp": "2026-04-26T01:00:00", "user_name": "Kuro", "text": "hello", "is_bot": 0},
+        ]
+        formatted = batcher._format_messages_for_prompt(messages, channel_type=None)
+        assert "Channel type" not in formatted
+
+    def test_format_messages_uses_user_id_fallback_for_realtime(self):
+        """_format_messages_for_prompt uses user_id as fallback when user_name is absent."""
+        batcher = ExtractionBatcher.__new__(ExtractionBatcher)
+        messages = [
+            {"timestamp": "2026-04-26T01:00:00", "user_id": "U_ABC123", "text": "hello", "is_bot": 0},
+        ]
+        formatted = batcher._format_messages_for_prompt(messages)
+        assert "@U_ABC123: hello" in formatted
+
+    @pytest.mark.asyncio
+    async def test_extract_channel_realtime_calls_get_realtime_unprocessed(
+        self, nixi_config: NixiConfig, db_conn, tmp_path: Path
+    ):
+        """ExtractionBatcher with source='realtime' calls get_realtime_unprocessed."""
+        # Set up both schemas
+        ensure_realtime_schema(nixi_config.db_path)
+
+        # Insert realtime messages directly
+        conn = get_connection(nixi_config.db_path)
+        for i in range(25):
+            conn.execute(
+                """INSERT INTO realtime_messages
+                   (slack_ts, channel_id, user_id, text, event_id, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (f"1766766571.{i:06d}", "C_RT_CH", "U_TEST", f"msg {i}", f"Ev{i}", "2026-04-26T00:00:00+00:00"),
+            )
+        conn.commit()
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="## Extracted\n- Test data")
+
+        with patch("nixi.extraction.batch.write_org_facts"), \
+             patch("nixi.extraction.batch.write_rules"), \
+             patch("nixi.extraction.batch.write_employee_info"), \
+             patch("nixi.extraction.batch.write_channel_skill"):
+            batcher = ExtractionBatcher(nixi_config, conn, mock_llm, source="realtime", min_messages=20)
+            result = await batcher.extract_channel("C_RT_CH")
+
+        assert result is not None
+        assert result.get("skipped") is False
+        assert result.get("message_count") == 25
+        conn.close()
+
+    @pytest.mark.asyncio
+    async def test_extract_channel_realtime_marks_extracted_shared_log(
+        self, nixi_config: NixiConfig, tmp_path: Path
+    ):
+        """ExtractionBatcher source='realtime' marks extracted in shared nixi_extraction_log."""
+        ensure_realtime_schema(nixi_config.db_path)
+        ensure_schema(nixi_config.db_path)
+        conn = get_connection(nixi_config.db_path)
+
+        for i in range(25):
+            conn.execute(
+                """INSERT INTO realtime_messages
+                   (slack_ts, channel_id, user_id, text, event_id, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (f"1766766571.{i:06d}", "C_RT_CH", "U_TEST", f"msg {i}", f"Ev{i}", "2026-04-26T00:00:00+00:00"),
+            )
+        conn.commit()
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="## Extracted\n- Test data")
+
+        with patch("nixi.extraction.batch.write_org_facts"), \
+             patch("nixi.extraction.batch.write_rules"), \
+             patch("nixi.extraction.batch.write_employee_info"), \
+             patch("nixi.extraction.batch.write_channel_skill"):
+            batcher = ExtractionBatcher(nixi_config, conn, mock_llm, source="realtime", min_messages=20)
+            await batcher.extract_channel("C_RT_CH")
+
+        # Verify messages are now in extraction_log (shared table)
+        cursor = conn.execute("SELECT COUNT(*) FROM nixi_extraction_log")
+        assert cursor.fetchone()["COUNT(*)"] == 25
+
+        # Realtime unprocessed should now return 0 for this channel
+        unprocessed = get_realtime_unprocessed(conn, "C_RT_CH")
+        assert len(unprocessed) == 0
+
+        conn.close()
+
+    @pytest.mark.asyncio
+    async def test_extract_all_realtime_calls_get_realtime_unprocessed_channels(
+        self, nixi_config: NixiConfig, tmp_path: Path
+    ):
+        """ExtractionBatcher.extract_all with source='realtime' uses get_realtime_unprocessed_channels."""
+        ensure_realtime_schema(nixi_config.db_path)
+        ensure_schema(nixi_config.db_path)
+        conn = get_connection(nixi_config.db_path)
+
+        for i in range(25):
+            conn.execute(
+                """INSERT INTO realtime_messages
+                   (slack_ts, channel_id, user_id, text, event_id, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (f"1766766571.{i:06d}", "C_RT_CH1", "U_TEST", f"msg {i}", f"Ev1_{i}", "2026-04-26T00:00:00+00:00"),
+            )
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="## Extracted\n- Test data")
+
+        with patch("nixi.extraction.batch.write_org_facts"), \
+             patch("nixi.extraction.batch.write_rules"), \
+             patch("nixi.extraction.batch.write_employee_info"), \
+             patch("nixi.extraction.batch.write_channel_skill"):
+            batcher = ExtractionBatcher(nixi_config, conn, mock_llm, source="realtime", min_messages=20)
+            result = await batcher.extract_all()
+
+        assert result is not None
+        assert "channels" in result
+        conn.close()

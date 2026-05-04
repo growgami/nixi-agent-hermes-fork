@@ -12,8 +12,11 @@ import pytest
 from nixi.db import (
     build_user_map,
     count_by_channel,
+    ensure_realtime_schema,
     ensure_schema,
     get_connection,
+    get_realtime_unprocessed,
+    get_realtime_unprocessed_channels,
     get_unprocessed,
     get_unprocessed_channels,
     insert_messages,
@@ -365,4 +368,272 @@ class TestGetConnection:
         cursor = conn.execute("SELECT slack_ts FROM scraped_messages")
         row = cursor.fetchone()
         assert row["slack_ts"] == "1766766571.412779"
+        conn.close()
+
+
+# ── ensure_realtime_schema ────────────────────────────────────────────────────
+
+
+class TestEnsureRealtimeSchema:
+    def test_creates_realtime_messages_table(self, db_path: Path):
+        """ensure_realtime_schema creates realtime_messages with indexes."""
+        from nixi.db import ensure_realtime_schema
+        ensure_realtime_schema(db_path)
+        conn = get_connection(db_path)
+
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = {row["name"] for row in cursor.fetchall()}
+        assert "realtime_messages" in tables
+
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+        )
+        indexes = {row["name"] for row in cursor.fetchall()}
+        assert "idx_rm_event_id" in indexes
+        assert "idx_rm_channel_ts" in indexes
+        assert "idx_rm_team" in indexes
+
+        conn.close()
+
+    def test_idempotent_realtime_schema_creation(self, db_path: Path):
+        """Running ensure_realtime_schema twice does not raise."""
+        from nixi.db import ensure_realtime_schema
+        ensure_realtime_schema(db_path)
+        ensure_realtime_schema(db_path)  # Should not raise
+
+    def test_realtime_schema_creates_parent_directory(self, tmp_path: Path):
+        """ensure_realtime_schema creates db parent directory if missing."""
+        from nixi.db import ensure_realtime_schema
+        db_path = tmp_path / "nested" / "dir" / "nixi_state.db"
+        ensure_realtime_schema(db_path)
+        assert db_path.parent.is_dir()
+
+    def test_team_id_is_nullable(self, db_path: Path):
+        """team_id column accepts NULL values."""
+        from nixi.db import ensure_realtime_schema
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        # Insert a message with team_id = NULL
+        conn.execute(
+            """INSERT INTO realtime_messages
+               (slack_ts, channel_id, user_id, text, event_id, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("1234567890.000001", "C_TEST", None, "test msg", "Ev123", "2026-04-26T00:00:00"),
+        )
+        conn.commit()
+
+        cursor = conn.execute("SELECT team_id FROM realtime_messages WHERE slack_ts = ?", ("1234567890.000001",))
+        assert cursor.fetchone()["team_id"] is None
+        conn.close()
+
+    def test_realtime_schema_matches_ingester_schema(self, db_path: Path):
+        """schema_realtime.sql produces identical schema to infra/ingester/schema.sql."""
+        from nixi.db import ensure_realtime_schema
+        ensure_realtime_schema(db_path)
+        conn = get_connection(db_path)
+
+        # Verify all columns exist with correct nullability
+        cursor = conn.execute("PRAGMA table_info(realtime_messages)")
+        columns = {row["name"]: row["notnull"] for row in cursor.fetchall()}
+
+        # Required columns (NOT NULL)
+        assert columns.get("slack_ts") == 1
+        assert columns.get("channel_id") == 1
+        assert columns.get("text") == 1
+        assert columns.get("event_id") == 1
+        assert columns.get("timestamp") == 1
+
+        # Nullable columns
+        assert columns.get("user_id") == 0
+        assert columns.get("thread_ts") == 0
+        assert columns.get("parent_ts") == 0
+        assert columns.get("channel_type") == 0
+        assert columns.get("client_msg_id") == 0
+        assert columns.get("team_id") == 0  # Nullable per bob review
+
+        conn.close()
+
+
+# ── get_realtime_unprocessed ──────────────────────────────────────────────────
+
+
+class TestGetRealtimeUnprocessed:
+    def _insert_realtime_message(
+        self,
+        conn,
+        slack_ts="1766766571.000001",
+        channel_id="C06M81FSKFF",
+        user_id=None,
+        text="hello",
+        thread_ts=None,
+        parent_ts=None,
+        is_bot=0,
+        channel_type=None,
+        event_id="Ev001",
+        client_msg_id=None,
+        team_id=None,
+        timestamp="2026-04-26T00:00:00+00:00",
+    ):
+        """Helper to insert a row into realtime_messages."""
+        conn.execute(
+            """INSERT INTO realtime_messages
+               (slack_ts, channel_id, user_id, text, thread_ts, parent_ts,
+                is_bot, channel_type, event_id, client_msg_id, team_id, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (slack_ts, channel_id, user_id, text, thread_ts, parent_ts,
+             is_bot, channel_type, event_id, client_msg_id, team_id, timestamp),
+        )
+        conn.commit()
+
+    def test_returns_unprocessed_messages(self, db_path: Path):
+        """get_realtime_unprocessed returns messages not in extraction_log."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        self._insert_realtime_message(conn, slack_ts="1766766571.000001", channel_id="C_TEST", event_id="Ev1")
+        self._insert_realtime_message(conn, slack_ts="1766766571.000002", channel_id="C_TEST", event_id="Ev2")
+
+        result = get_realtime_unprocessed(conn, "C_TEST")
+        assert len(result) == 2
+        conn.close()
+
+    def test_excludes_extracted_messages(self, db_path: Path):
+        """Messages in extraction_log are excluded from realtime unprocessed."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        self._insert_realtime_message(conn, slack_ts="1766766571.000001", channel_id="C_TEST", event_id="Ev1")
+        self._insert_realtime_message(conn, slack_ts="1766766571.000002", channel_id="C_TEST", event_id="Ev2")
+
+        # Mark first as extracted using shared extraction log
+        mark_extracted(conn, "C_TEST", ["1766766571.000001"], "batch-1")
+
+        result = get_realtime_unprocessed(conn, "C_TEST")
+        assert len(result) == 1
+        assert result[0]["slack_ts"] == "1766766571.000002"
+        conn.close()
+
+    def test_shared_extraction_log_dedup(self, db_path: Path):
+        """A message extracted from scraped_messages won't be re-extracted from realtime."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        # Insert same message in both tables (same channel_id + slack_ts)
+        insert_messages(conn, [_make_message(slack_ts="1766766571.000001", channel_id="C_TEST")])
+        self._insert_realtime_message(conn, slack_ts="1766766571.000001", channel_id="C_TEST", event_id="Ev1")
+
+        # Mark extracted from scraped_messages
+        mark_extracted(conn, "C_TEST", ["1766766571.000001"], "batch-1")
+
+        # Should also be excluded from realtime unprocessed (shared extraction log)
+        result = get_realtime_unprocessed(conn, "C_TEST")
+        assert len(result) == 0
+        conn.close()
+
+    def test_limit_parameter(self, db_path: Path):
+        """Limit parameter caps the result count."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        for i in range(5):
+            self._insert_realtime_message(conn, slack_ts=f"1766766571.{i:06d}", channel_id="C_TEST", event_id=f"Ev{i}")
+
+        result = get_realtime_unprocessed(conn, "C_TEST", limit=3)
+        assert len(result) == 3
+        conn.close()
+
+    def test_filters_by_channel(self, db_path: Path):
+        """Only returns messages for the requested channel."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        self._insert_realtime_message(conn, slack_ts="1766766571.000001", channel_id="C_CH1", event_id="Ev1")
+        self._insert_realtime_message(conn, slack_ts="1766766571.000002", channel_id="C_CH2", event_id="Ev2")
+
+        result = get_realtime_unprocessed(conn, "C_CH1")
+        assert len(result) == 1
+        assert result[0]["channel_id"] == "C_CH1"
+        conn.close()
+
+
+# ── get_realtime_unprocessed_channels ────────────────────────────────────────
+
+
+class TestGetRealtimeUnprocessedChannels:
+    def _insert_realtime_message(
+        self,
+        conn,
+        slack_ts="1766766571.000001",
+        channel_id="C06M81FSKFF",
+        event_id="Ev001",
+        timestamp="2026-04-26T00:00:00+00:00",
+    ):
+        """Helper to insert a row into realtime_messages."""
+        conn.execute(
+            """INSERT INTO realtime_messages
+               (slack_ts, channel_id, text, event_id, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            (slack_ts, channel_id, "test", event_id, timestamp),
+        )
+        conn.commit()
+
+    def test_returns_channels_with_unprocessed(self, db_path: Path):
+        """Returns channel_ids that have unprocessed realtime messages."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed_channels
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        conn.execute(
+            """INSERT INTO realtime_messages
+               (slack_ts, channel_id, text, event_id, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("1766766571.000001", "C_CH1", "msg1", "Ev1", "2026-04-26T00:00:00+00:00"),
+        )
+        conn.execute(
+            """INSERT INTO realtime_messages
+               (slack_ts, channel_id, text, event_id, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("1766766571.000002", "C_CH2", "msg2", "Ev2", "2026-04-26T00:00:00+00:00"),
+        )
+        conn.commit()
+
+        channels = get_realtime_unprocessed_channels(conn)
+        assert "C_CH1" in channels
+        assert "C_CH2" in channels
+        conn.close()
+
+    def test_excludes_fully_extracted_channels(self, db_path: Path):
+        """A channel with all messages extracted is not returned."""
+        from nixi.db import ensure_realtime_schema, get_realtime_unprocessed_channels
+        ensure_realtime_schema(db_path)
+        ensure_schema(db_path)
+        conn = get_connection(db_path)
+
+        conn.execute(
+            """INSERT INTO realtime_messages
+               (slack_ts, channel_id, text, event_id, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("1766766571.000001", "C_CH1", "msg1", "Ev1", "2026-04-26T00:00:00+00:00"),
+        )
+        conn.commit()
+
+        mark_extracted(conn, "C_CH1", ["1766766571.000001"], "batch-1")
+
+        channels = get_realtime_unprocessed_channels(conn)
+        assert "C_CH1" not in channels
         conn.close()
