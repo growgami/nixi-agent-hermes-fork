@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from nixi.intent_classifier import ClassificationResult, classify
+from nixi.protocols import NOHELLO_PROTOCOL
 
 # Default "pass" result for mocking the classifier in dispatch tests.
 # These tests focus on the adapter's dispatch logic, not the classifier,
 # so we bypass classification by always returning "pass".
-_CLASSIFY_PASS = ClassificationResult(action="pass", response_text=None, reason="test_pass")
+_CLASSIFY_PASS = ClassificationResult(action="pass", reason="test_pass")
 
 # Skip entire module if aiohttp not available
 try:
@@ -372,7 +373,7 @@ class TestEventDispatch:
 
     @pytest.mark.asyncio
     async def test_dispatch_creates_message_event_with_overlay(self, nixi_adapter):
-        """Valid events should dispatch with employee overlay in channel_prompt."""
+        """Valid events should dispatch with overlay + NOHELLO_PROTOCOL in channel_prompt."""
         with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
              patch("nixi.gateway_adapter.load_overlay", return_value="# Employee context\nYou are helpful"):
             called_events = []
@@ -395,7 +396,8 @@ class TestEventDispatch:
             assert len(called_events) == 1
             event = called_events[0]
             assert event.text == "hello"
-            assert event.channel_prompt == "# Employee context\nYou are helpful"
+            expected_prompt = f"# Employee context\nYou are helpful\n\n{NOHELLO_PROTOCOL}"
+            assert event.channel_prompt == expected_prompt
             assert event.source.platform == Platform.NIXI
             assert event.source.user_id == "U123"
             assert event.source.user_name == "Alice"
@@ -403,7 +405,7 @@ class TestEventDispatch:
 
     @pytest.mark.asyncio
     async def test_dispatch_with_empty_overlay(self, nixi_adapter):
-        """Empty overlay should result in channel_prompt=None."""
+        """Empty overlay should result in channel_prompt=NOHELLO_PROTOCOL (protocol always present)."""
         with patch("nixi.gateway_adapter.classify", return_value=_CLASSIFY_PASS), \
              patch("nixi.gateway_adapter.load_overlay", return_value=""):
             called_events = []
@@ -424,7 +426,7 @@ class TestEventDispatch:
 
             assert len(called_events) == 1
             event = called_events[0]
-            assert event.channel_prompt is None
+            assert event.channel_prompt == NOHELLO_PROTOCOL
 
     @pytest.mark.asyncio
     async def test_dispatch_extracts_thread_ts(self, nixi_adapter):
@@ -1016,15 +1018,18 @@ class TestBotNamesWiring:
 
 class TestIntentClassifierIntegration:
     """Integration tests verifying the full classification flow from
-    _dispatch_event through to the correct action (DROP/RESPOND/PASS).
+    _dispatch_event through to the correct action (DROP/PASS).
 
     Unlike the other test classes that mock classify() to always PASS,
     these tests exercise the REAL classify() function through the dispatch
     path, verifying end-to-end behavior of the classifier + adapter.
+
+    After the RESPOND path was removed, greeting messages now follow PASS:
+    the classifier returns action="pass" and the adapter injects
+    NOHELLO_PROTOCOL into channel_prompt so the LLM knows how to respond.
     """
 
     BOT_USER_ID = "UBOT99999"  # Slack user IDs are uppercase — matches _MENTION_RE
-    NOHELLO_URL = "https://nohello.net"
 
     def _make_dm_event(self, text: str, channel: str = "D12345", **extra_fields) -> dict:
         """Build a DM event payload."""
@@ -1047,11 +1052,13 @@ class TestIntentClassifierIntegration:
         event.update(extra_fields)
         return {"event": event}
 
+    # ─── PASS path: greetings now pass through to the LLM ──────────────
+
     @pytest.mark.asyncio
-    async def test_dm_greeting_sends_nohello_url(self, nixi_adapter):
-        """DM greeting → classify returns RESPOND → self.send() called with nohello.net URL on DM channel."""
+    async def test_dm_greeting_passes_with_nohello_protocol(self, nixi_adapter):
+        """DM greeting → classify returns PASS → background task created with
+        NOHELLO_PROTOCOL in channel_prompt (no direct send)."""
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1061,29 +1068,24 @@ class TestIntentClassifierIntegration:
 
         nixi_adapter._message_handler = capture_event
 
-        await nixi_adapter._dispatch_event(
-            self._make_dm_event("hey"),
-            user_id="U_USER1",
-            user_name="TestUser",
-        )
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_dm_event("hey"),
+                user_id="U_USER1",
+                user_name="TestUser",
+            )
 
-        # RESPOND path: send() called with DM channel ID, no background task
-        nixi_adapter.send.assert_called_once()
-        call_args = nixi_adapter.send.call_args
-        # First positional arg is chat_id — must be the DM channel ID (D-prefix)
-        assert call_args[0][0].startswith("D")
-        assert call_args[0][0] == "D12345"
-        # Second arg is response text — must be nohello.net URL
-        assert call_args[0][1] == self.NOHELLO_URL
-        # No background task created (no message_handler call)
-        await asyncio.sleep(0.05)
-        assert len(called_events) == 0
+        # PASS: background task created, handle_message called
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        event = called_events[0]
+        assert event.channel_prompt == NOHELLO_PROTOCOL
+        assert event.source.chat_id == "D12345"
 
     @pytest.mark.asyncio
-    async def test_channel_mention_greeting_responds(self, nixi_adapter):
-        """Channel "@bot hey" → RESPOND path fires with correct chat_id."""
+    async def test_channel_mention_greeting_passes_with_nohello_protocol(self, nixi_adapter):
+        """Channel "@bot hey" → PASS with NOHELLO_PROTOCOL in channel_prompt."""
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1093,19 +1095,21 @@ class TestIntentClassifierIntegration:
 
         nixi_adapter._message_handler = capture_event
 
-        await nixi_adapter._dispatch_event(
-            self._make_channel_event(f"<@{self.BOT_USER_ID}> hey"),
-            user_id="U_USER2",
-            user_name="TestUser2",
-        )
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event(f"<@{self.BOT_USER_ID}> hey"),
+                user_id="U_USER2",
+                user_name="TestUser2",
+            )
 
-        # RESPOND: send() called on the channel ID
-        nixi_adapter.send.assert_called_once()
-        assert nixi_adapter.send.call_args[0][0] == "C99999"
-        assert nixi_adapter.send.call_args[0][1] == self.NOHELLO_URL
-        # No background task
-        await asyncio.sleep(0.05)
-        assert len(called_events) == 0
+        # PASS: background task created with NOHELLO_PROTOCOL
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        event = called_events[0]
+        assert event.channel_prompt == NOHELLO_PROTOCOL
+        assert event.source.chat_id == "C99999"
+
+    # ─── PASS path: substantive messages with protocol ─────────────────
 
     @pytest.mark.asyncio
     async def test_channel_mention_substantive_passes(self, nixi_adapter):
@@ -1116,7 +1120,6 @@ class TestIntentClassifierIntegration:
 
         async def capture_event(event):
             called_events.append(event)
-            # Return None — no agent response to send back
             return None
 
         nixi_adapter._message_handler = capture_event
@@ -1132,12 +1135,95 @@ class TestIntentClassifierIntegration:
         await asyncio.sleep(0.1)
         assert len(called_events) == 1
         assert called_events[0].text == f"<@{self.BOT_USER_ID}> summarize the thread"
+        # NOHELLO_PROTOCOL always in channel_prompt
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
+
+    # ─── PASS path: protocol + overlay combination ─────────────────────
+
+    @pytest.mark.asyncio
+    async def test_overlay_and_protocol_combined(self, nixi_adapter):
+        """PASS with overlay present → channel_prompt has overlay + NOHELLO_PROTOCOL."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value="# Employee context\nYou are helpful"):
+            await nixi_adapter._dispatch_event(
+                self._make_dm_event("hey"),
+                user_id="U_OVERLAY1",
+                user_name="OverlayUser",
+            )
+
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        event = called_events[0]
+        # channel_prompt combines overlay and protocol, separated by double newline
+        assert event.channel_prompt == f"# Employee context\nYou are helpful\n\n{NOHELLO_PROTOCOL}"
+        assert NOHELLO_PROTOCOL in event.channel_prompt
+        assert "# Employee context" in event.channel_prompt
+
+    @pytest.mark.asyncio
+    async def test_protocol_only_without_overlay(self, nixi_adapter):
+        """PASS without overlay → channel_prompt is just NOHELLO_PROTOCOL."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event(f"<@{self.BOT_USER_ID}> summarize the thread"),
+                user_id="U_NO_OVERLAY",
+                user_name="NoOverlayUser",
+            )
+
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
+
+    @pytest.mark.asyncio
+    async def test_substantive_mention_also_includes_protocol(self, nixi_adapter):
+        """Substantive mention ("@bot summarize the thread") → PASS with NOHELLO_PROTOCOL
+        in channel_prompt — protocol is always appended, not just for greetings."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event(f"<@{self.BOT_USER_ID}> summarize the thread"),
+                user_id="U_SUB_MENTION",
+                user_name="SubMentionUser",
+            )
+
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        # Protocol is always in channel_prompt for PASS-path messages
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
+
+    # ─── DROP path tests ───────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_channel_mention_acknowledgment_drops(self, nixi_adapter):
-        """Channel "@bot thanks!" → DROP (no send, no background task)."""
+        """Channel "@bot thanks!" → DROP (no background task)."""
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1153,9 +1239,31 @@ class TestIntentClassifierIntegration:
             user_name="TestUser4",
         )
 
-        # DROP: no send, no background task
+        # DROP: no background task
         await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
+        assert len(called_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_unrelated_channel_message_drops(self, nixi_adapter):
+        """Unrelated channel message (no mention, no thread) → DROP."""
+        nixi_adapter._bot_user_id = self.BOT_USER_ID
+
+        called_events = []
+
+        async def capture_event(event):
+            called_events.append(event)
+            return "response"
+
+        nixi_adapter._message_handler = capture_event
+
+        await nixi_adapter._dispatch_event(
+            self._make_channel_event("just chatting about work stuff"),
+            user_id="U_USER6",
+            user_name="TestUser6",
+        )
+
+        # DROP: no background task
+        await asyncio.sleep(0.05)
         assert len(called_events) == 0
 
     @pytest.mark.asyncio
@@ -1189,31 +1297,8 @@ class TestIntentClassifierIntegration:
         await asyncio.sleep(0.1)
         assert len(called_events) == 1
         assert called_events[0].source.thread_id == thread_ts
-
-    @pytest.mark.asyncio
-    async def test_unrelated_channel_message_drops(self, nixi_adapter):
-        """Unrelated channel message (no mention, no thread) → DROP."""
-        nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
-
-        called_events = []
-
-        async def capture_event(event):
-            called_events.append(event)
-            return "response"
-
-        nixi_adapter._message_handler = capture_event
-
-        await nixi_adapter._dispatch_event(
-            self._make_channel_event("just chatting about work stuff"),
-            user_id="U_USER6",
-            user_name="TestUser6",
-        )
-
-        # DROP: no send, no background task
-        await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
-        assert len(called_events) == 0
+        # Protocol is always present
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
 
     @pytest.mark.asyncio
     async def test_thread_mention_cache_records_and_returns(self, nixi_adapter):
@@ -1244,7 +1329,6 @@ class TestIntentClassifierIntegration:
     async def test_subtype_message_changed_drops(self, nixi_adapter):
         """Event with subtype="message_changed" → DROP before classifier."""
         nixi_adapter._bot_user_id = self.BOT_USER_ID
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1267,17 +1351,14 @@ class TestIntentClassifierIntegration:
             user_name="TestUser7",
         )
 
-        # Subtype filter blocks before classifier — no send, no background task
+        # Subtype filter blocks before classifier — no background task
         await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
         assert len(called_events) == 0
 
     @pytest.mark.asyncio
     async def test_empty_bot_user_id_no_false_positives(self, nixi_adapter):
         """Empty NIXI_BOT_USER_ID → bot_mentioned=False for all messages (conservative)."""
-        # Set empty bot_user_id
         nixi_adapter._bot_user_id = ""
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1297,7 +1378,6 @@ class TestIntentClassifierIntegration:
         # With empty bot_user_id, the mention detection returns False.
         # The mention rules skip, and the unrelated_drop_rule fires → DROP
         await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
         assert len(called_events) == 0
 
     # ─── Bot name mention integration tests ──────────────────────────────
@@ -1328,20 +1408,20 @@ class TestIntentClassifierIntegration:
         await asyncio.sleep(0.1)
         assert len(called_events) == 1
         assert called_events[0].text == "nixi summarize the thread"
+        # Protocol always present in PASS-path events
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
 
     @pytest.mark.asyncio
-    async def test_channel_name_mention_greeting_drops(self, nixi_adapter):
-        """Channel "hey nixi" (no <@...> mention, name-only greeting) → DROP.
+    async def test_channel_name_mention_greeting_passes(self, nixi_adapter):
+        """Channel "hey nixi" (name-only greeting) → PASS (greeting_mention_rule fires).
 
-        The classifier's _is_greeting_only only strips <@U...> mentions, not bot
-        names, so "hey nixi" retains "nixi" after greeting removal and is not
-        recognized as greeting-only. It falls through to unrelated_drop_rule.
-        This test documents the current behavior: name-only greetings without
-        substantive content are dropped rather than responded to.
+        The classifier's _is_greeting_only strips bot names when bot_names is set,
+        so "hey nixi" becomes "hey" which is recognized as greeting-only.
+        The greeting_mention_rule returns PASS, and the LLM receives the message
+        with NOHELLO_PROTOCOL to handle it appropriately.
         """
         nixi_adapter._bot_user_id = self.BOT_USER_ID
         nixi_adapter._bot_names = ("nixi",)
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1351,16 +1431,17 @@ class TestIntentClassifierIntegration:
 
         nixi_adapter._message_handler = capture_event
 
-        await nixi_adapter._dispatch_event(
-            self._make_channel_event("hey nixi"),
-            user_id="U_NAME_GREET",
-            user_name="NameGreeting",
-        )
+        with patch("nixi.gateway_adapter.load_overlay", return_value=""):
+            await nixi_adapter._dispatch_event(
+                self._make_channel_event("hey nixi"),
+                user_id="U_NAME_GREET",
+                user_name="NameGreeting",
+            )
 
-        # DROP: name-mention greeting not recognized as greeting-only → unrelated_drop
-        await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
-        assert len(called_events) == 0
+        # PASS: greeting_mention_rule fires via name detection
+        await asyncio.sleep(0.1)
+        assert len(called_events) == 1
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
 
     @pytest.mark.asyncio
     async def test_channel_name_mention_noise_drop(self, nixi_adapter):
@@ -1372,7 +1453,6 @@ class TestIntentClassifierIntegration:
         """
         nixi_adapter._bot_user_id = self.BOT_USER_ID
         nixi_adapter._bot_names = ("nixi",)
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1388,9 +1468,8 @@ class TestIntentClassifierIntegration:
             user_name="NameNoise",
         )
 
-        # DROP: no send, no background task
+        # DROP: no background task
         await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
         assert len(called_events) == 0
 
     @pytest.mark.asyncio
@@ -1422,6 +1501,8 @@ class TestIntentClassifierIntegration:
         # PASS: exactly one event dispatched (no double-processing)
         await asyncio.sleep(0.1)
         assert len(called_events) == 1
+        # Protocol always present
+        assert called_events[0].channel_prompt == NOHELLO_PROTOCOL
 
     @pytest.mark.asyncio
     async def test_empty_bot_names_no_false_positives(self, nixi_adapter):
@@ -1429,7 +1510,6 @@ class TestIntentClassifierIntegration:
         unrelated_drop_rule fires). Verifies no false positives without bot_names."""
         nixi_adapter._bot_user_id = self.BOT_USER_ID
         nixi_adapter._bot_names = ()
-        nixi_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         called_events = []
 
@@ -1447,5 +1527,4 @@ class TestIntentClassifierIntegration:
 
         # DROP: no name match, no slack mention, unrelated_drop_rule fires
         await asyncio.sleep(0.05)
-        nixi_adapter.send.assert_not_called()
         assert len(called_events) == 0
