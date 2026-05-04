@@ -20,7 +20,7 @@ from nixi.db import (
     insert_messages,
     mark_extracted,
 )
-from nixi.extraction.batch import ExtractionBatcher
+from nixi.extraction.batch import ExtractionBatcher, LLMClient
 from nixi.extraction.prompts import (
     CHANNEL_SKILL_PROMPT,
     EMPLOYEE_PROMPT,
@@ -672,7 +672,8 @@ class TestCLI:
         mock_llm = AsyncMock()
         mock_llm.chat = AsyncMock(return_value="## Facts\n- Test")
 
-        with patch("nixi.extract.ExtractionBatcher") as MockBatcher:
+        with patch("nixi.extract.ExtractionBatcher") as MockBatcher, \
+             patch("nixi.extract.LLMClient", return_value=mock_llm):
             mock_batcher = AsyncMock()
             mock_batcher.extract_all = AsyncMock(return_value={"channels": 1, "messages": 25})
             MockBatcher.return_value = mock_batcher
@@ -691,10 +692,122 @@ class TestCLI:
         mock_llm = AsyncMock()
         mock_llm.chat = AsyncMock(return_value="## Facts\n- Test")
 
-        with patch("nixi.extract.ExtractionBatcher") as MockBatcher:
+        with patch("nixi.extract.ExtractionBatcher") as MockBatcher, \
+             patch("nixi.extract.LLMClient", return_value=mock_llm):
             mock_batcher = AsyncMock()
             mock_batcher.extract_channel = AsyncMock(return_value={"skipped": False})
             MockBatcher.return_value = mock_batcher
 
             result = await run_extraction_channel("C06M81FSKFF", nixi_config)
             assert result is not None
+
+
+# ── LLMClient wiring ──────────────────────────────────────────────────────────
+
+
+class TestLLMClient:
+    """Test LLMClient.__init__ and chat() wiring to resolve_provider_client."""
+
+    def test_raises_runtime_error_when_extraction_model_empty(self):
+        """LLMClient.__init__ raises RuntimeError when extraction_model is empty."""
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="",
+        )
+        with pytest.raises(RuntimeError, match="No extraction model configured"):
+            LLMClient(config)
+
+    def test_raises_runtime_error_when_no_provider(self):
+        """LLMClient.__init__ raises RuntimeError when resolve_provider_client returns (None, None)."""
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(None, None)):
+            with pytest.raises(RuntimeError, match="No LLM provider configured"):
+                LLMClient(config)
+
+    def test_resolves_provider_on_init(self):
+        """LLMClient.__init__ resolves provider client and stores _client and _resolved_model only."""
+        mock_client = MagicMock()
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(mock_client, "test-model")):
+            llm = LLMClient(config)
+
+        assert llm._client is mock_client
+        assert llm._resolved_model == "test-model"
+        # Must NOT store self.config
+        assert not hasattr(llm, "config")
+
+    @pytest.mark.asyncio
+    async def test_chat_calls_provider_and_returns_content(self):
+        """LLMClient.chat() calls client.chat.completions.create and returns content."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "hello"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(mock_client, "test-model")):
+            llm = LLMClient(config)
+
+        result = await llm.chat("test prompt")
+        assert result == "hello"
+        mock_client.chat.completions.create.assert_called_once_with(
+            model="test-model",
+            messages=[{"role": "user", "content": "test prompt"}],
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_sends_messages_in_correct_format(self):
+        """LLMClient.chat() sends messages in [{"role": "user", "content": prompt}] format."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "response text"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(mock_client, "resolved-model")):
+            llm = LLMClient(config)
+
+        await llm.chat("some prompt text")
+        call_kwargs = mock_client.chat.completions.create.call_args
+        assert call_kwargs.kwargs["model"] == "resolved-model"
+        messages = call_kwargs.kwargs["messages"]
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "some prompt text"
+
+    def test_does_not_store_self_model(self):
+        """LLMClient does NOT store self._model — extraction_model passed directly to resolve_provider_client."""
+        mock_client = MagicMock()
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(mock_client, "resolved-model")) as mock_resolve:
+            llm = LLMClient(config)
+
+        # resolve_provider_client was called with the model from config
+        mock_resolve.assert_called_once_with("auto", model="gpt-4o", async_mode=True)
+        # No _model attribute stored (BOB N2: only _resolved_model matters)
+        assert not hasattr(llm, "_model")

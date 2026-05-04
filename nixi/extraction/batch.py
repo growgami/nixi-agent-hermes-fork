@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.auxiliary_client import resolve_provider_client
 from nixi.config import NixiConfig
 from nixi.db import (
     build_user_map,
@@ -45,8 +47,25 @@ class LLMClient:
     """
 
     def __init__(self, config: NixiConfig) -> None:
-        self.config = config
-        self.model = config.extraction_model
+        if not config.extraction_model:
+            raise RuntimeError(
+                "No extraction model configured. "
+                "Set extraction_model in config.yaml or NIXI_MODEL environment variable."
+            )
+
+        client, resolved_model = resolve_provider_client(
+            "auto", model=config.extraction_model, async_mode=True
+        )
+        if client is None or resolved_model is None:
+            raise RuntimeError(
+                "No LLM provider configured. "
+                "Set an API key in .env (e.g. OPENAI_API_KEY, OPENROUTER_API_KEY) "
+                f"or configure a provider via hermes model. "
+                f"HERMES_HOME: {os.environ.get('HERMES_HOME', 'not set')}"
+            )
+
+        self._client = client
+        self._resolved_model = resolved_model
 
     async def chat(self, prompt: str) -> str:
         """Send a prompt to the LLM and return the response text.
@@ -57,13 +76,11 @@ class LLMClient:
         Returns:
             LLM response text.
         """
-        # In production, this calls the hermes agent's LLM provider.
-        # For testing and standalone use, this can be mocked.
-        # This thin wrapper delegates to the actual provider at runtime.
-        raise NotImplementedError(
-            "LLMClient.chat() requires a concrete provider implementation. "
-            "Use a mock for testing or configure extraction_model in NixiConfig."
+        messages = [{"role": "user", "content": prompt}]
+        response = await self._client.chat.completions.create(
+            model=self._resolved_model, messages=messages
         )
+        return response.choices[0].message.content
 
 
 class ExtractionBatcher:
