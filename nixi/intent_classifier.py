@@ -2,22 +2,26 @@
 
 Classification flow:
     1. Construct ClassificationContext from the Slack event
-    2. classify() evaluates ordered rules until one returns non-None
+    2. classify() evaluates ordered rules until one returned non-None
     3. Result action determines dispatch:
-       - "pass"    → continue to overlay load + LLM (normal flow)
-       - "respond" → send response_text directly, skip LLM
-       - "drop"    → discard the message entirely
+       - "pass" → continue to overlay load + LLM (normal flow)
+       - "drop" → discard the message entirely
+
+Greeting-only messages are classified as PASS (not dropped). The LLM
+receives them along with the NOHELLO_PROTOCOL communication protocol,
+which instructs it how to respond. This keeps classification simple and
+delegates response generation to the model.
 
 Rule order matters. First non-None result wins. Fallthrough = DROP.
 
 Rules:
-    dm_rule                 — DMs: greeting-only → RESPOND (nohello.net),
-                              substantive → PASS
+    dm_rule                 — DMs: greeting-only → PASS (dm_greeting),
+                              substantive → PASS (dm_message)
     thread_continuation_rule — Thread with prior bot engagement → PASS
     substantive_mention_rule — Bot mentioned + substantive content → PASS
-    greeting_mention_rule    — Bot mentioned + greeting-only → RESPOND (nohello.net)
+    greeting_mention_rule    — Bot mentioned + greeting-only → PASS (greeting_only)
     noise_mention_rule       — Bot mentioned + acknowledgment/noise → DROP
-    unrelated_drop_rule     — Catch-all → DROP
+    unrelated_drop_rule      — Catch-all → DROP
 
 Bot mention detection:
     Mention-dependent rules recognize bot invocations via both:
@@ -25,6 +29,10 @@ Bot mention detection:
     - Natural-language name mentions (via bot_name_mentioned)
     The ``bot_names`` field on ClassificationContext triggers name-based
     matching. Adapters should always include "nixi" as a default.
+
+    Bot names are also stripped from message text by _strip_mentions()
+    so that "hey nixi" is correctly classified as greeting-only (not
+    substantive) and plain "nixi" is treated as a greeting (not dropped).
 
 ThreadMentionCache tracks which threads the bot has engaged in,
 enabling thread continuation detection without Slack API calls.
@@ -81,14 +89,11 @@ class ClassificationResult:
     """Output of the classifier.
 
     Fields:
-        action:        "pass" (forward to LLM), "respond" (send reply directly),
-                       or "drop" (discard silently).
-        response_text: Text to send when action is "respond", None otherwise.
-        reason:        Human-readable label for observability/logging.
+        action: "pass" (forward to LLM) or "drop" (discard silently).
+        reason: Human-readable label for observability/logging.
     """
 
-    action: Literal["pass", "respond", "drop"]
-    response_text: Optional[str]
+    action: Literal["pass", "drop"]
     reason: str
 
 
@@ -148,8 +153,6 @@ class ThreadMentionCache:
 # Pattern constants
 # ---------------------------------------------------------------------------
 
-NOHELLO_URL = "https://nohello.net"
-
 # Slack mention patterns: <@U12345> and <@U12345|DisplayName>
 _MENTION_RE = re.compile(r"<@U[A-Z0-9]+(?:\|[^>]+)?>")
 
@@ -200,9 +203,32 @@ ACKNOWLEDGMENT_PATTERNS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
-def _strip_mentions(text: str) -> str:
-    """Remove all Slack mention patterns (<@U...> and <@U...|Name>) from text."""
-    return _MENTION_RE.sub("", text).strip()
+def _strip_mentions(text: str, bot_names: tuple[str, ...] = ()) -> str:
+    """Remove Slack mention patterns and bot names from text.
+
+    Strips <@U...> Slack mentions first, then strips each bot name using
+    lenient prefix matching (same pattern as bot_name_mentioned). This
+    ensures "hey nixi" → "hey" and plain "nixi" → "".
+    """
+    result = _MENTION_RE.sub("", text).strip()
+    if not bot_names:
+        return result
+    # Build a single regex that matches any bot name using lenient prefix.
+    # Reuse the same pattern as bot_name_mentioned for consistency.
+    parts: list[str] = []
+    for name in bot_names:
+        if len(name) < 3:
+            parts.append(re.escape(name))
+        else:
+            prefix = re.escape(name[:-1])
+            last_char = re.escape(name[-1])
+            parts.append(f"{prefix}{last_char}*")
+    name_pattern = re.compile(
+        r"\b(" + "|".join(parts) + r")\b",
+        re.IGNORECASE,
+    )
+    result = name_pattern.sub("", result).strip()
+    return result
 
 
 def bot_mentioned_in_text(text: str, bot_user_id: str) -> bool:
@@ -271,14 +297,14 @@ def bot_name_mentioned(text: str, bot_names: tuple[str, ...]) -> bool:
     return bool(pattern.search(text))
 
 
-def _is_greeting_only(text: str) -> bool:
+def _is_greeting_only(text: str, bot_names: tuple[str, ...] = ()) -> bool:
     """Return True if text is a greeting with no substantive content.
 
-    A message is "greeting-only" if, after stripping mentions and matching
-    greeting patterns, the remaining content is empty or trivial (just
-    punctuation, just the bot name repeated).
+    A message is "greeting-only" if, after stripping mentions and bot names
+    and matching greeting patterns, the remaining content is empty or trivial
+    (just punctuation, just the bot name repeated).
     """
-    stripped = _strip_mentions(text).strip()
+    stripped = _strip_mentions(text, bot_names).strip()
     if not stripped:
         # Message was only mentions — treat as greeting
         return True
@@ -311,13 +337,13 @@ def _is_greeting_only(text: str) -> bool:
     return False
 
 
-def _is_substantive(text: str) -> bool:
+def _is_substantive(text: str, bot_names: tuple[str, ...] = ()) -> bool:
     """Return True if text contains an actionable request or substantive content.
 
     Substantive means the text has: question marks, imperative verbs, or
     sufficient non-greeting content (3+ words after greeting removal).
     """
-    stripped = _strip_mentions(text).strip()
+    stripped = _strip_mentions(text, bot_names).strip()
     if not stripped:
         return False
 
@@ -341,13 +367,13 @@ def _is_substantive(text: str) -> bool:
     return False
 
 
-def _is_acknowledgment(text: str) -> bool:
+def _is_acknowledgment(text: str, bot_names: tuple[str, ...] = ()) -> bool:
     """Return True if text is a non-actionable acknowledgment (thanks, lol, ok, etc.).
 
-    Strips mentions first, then checks if the remaining text (after stripping
-    punctuation) matches known acknowledgment patterns.
+    Strips mentions and bot names first, then checks if the remaining text
+    (after stripping punctuation) matches known acknowledgment patterns.
     """
-    stripped = _strip_mentions(text).strip()
+    stripped = _strip_mentions(text, bot_names).strip()
     if not stripped:
         return False
 
@@ -372,20 +398,18 @@ def _is_acknowledgment(text: str) -> bool:
 
 
 def dm_rule(ctx: ClassificationContext) -> Optional[ClassificationResult]:
-    """DM messages: greeting-only → RESPOND with nohello.net, else → PASS."""
+    """DM messages: greeting-only → PASS (dm_greeting), else → PASS (dm_message)."""
     if not ctx.is_dm:
         return None
 
-    if _is_greeting_only(ctx.text):
+    if _is_greeting_only(ctx.text, ctx.bot_names):
         return ClassificationResult(
-            action="respond",
-            response_text=NOHELLO_URL,
+            action="pass",
             reason="dm_greeting",
         )
 
     return ClassificationResult(
         action="pass",
-        response_text=None,
         reason="dm_message",
     )
 
@@ -395,7 +419,6 @@ def thread_continuation_rule(ctx: ClassificationContext) -> Optional[Classificat
     if ctx.thread_ts and ctx.thread_had_bot:
         return ClassificationResult(
             action="pass",
-            response_text=None,
             reason="thread_continuation",
         )
     return None
@@ -409,27 +432,26 @@ def substantive_mention_rule(ctx: ClassificationContext) -> Optional[Classificat
     bot_invoked = bot_mentioned_in_text(ctx.text, ctx.bot_user_id) or bot_name_mentioned(ctx.text, ctx.bot_names)
     if not bot_invoked:
         return None
-    if _is_substantive(ctx.text):
+    if _is_substantive(ctx.text, ctx.bot_names):
         return ClassificationResult(
             action="pass",
-            response_text=None,
             reason="substantive_mention",
         )
     return None
 
 
 def greeting_mention_rule(ctx: ClassificationContext) -> Optional[ClassificationResult]:
-    """Bot mentioned with greeting-only content → RESPOND with nohello.net.
+    """Bot mentioned with greeting-only content → PASS (greeting_only).
 
     Recognizes both <@USERID> mentions and natural-language bot name mentions.
+    The greeting is forwarded to the LLM with NOHELLO_PROTOCOL context.
     """
     bot_invoked = bot_mentioned_in_text(ctx.text, ctx.bot_user_id) or bot_name_mentioned(ctx.text, ctx.bot_names)
     if not bot_invoked:
         return None
-    if _is_greeting_only(ctx.text):
+    if _is_greeting_only(ctx.text, ctx.bot_names):
         return ClassificationResult(
-            action="respond",
-            response_text=NOHELLO_URL,
+            action="pass",
             reason="greeting_only",
         )
     return None
@@ -443,10 +465,9 @@ def noise_mention_rule(ctx: ClassificationContext) -> Optional[ClassificationRes
     bot_invoked = bot_mentioned_in_text(ctx.text, ctx.bot_user_id) or bot_name_mentioned(ctx.text, ctx.bot_names)
     if not bot_invoked:
         return None
-    if _is_acknowledgment(ctx.text):
+    if _is_acknowledgment(ctx.text, ctx.bot_names):
         return ClassificationResult(
             action="drop",
-            response_text=None,
             reason="noise_mention",
         )
     return None
@@ -456,7 +477,6 @@ def unrelated_drop_rule(ctx: ClassificationContext) -> ClassificationResult:
     """Catch-all: no rule matched → DROP."""
     return ClassificationResult(
         action="drop",
-        response_text=None,
         reason="unrelated",
     )
 
