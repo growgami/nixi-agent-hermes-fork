@@ -150,8 +150,11 @@ class TestSafePathIntegration:
 
         This is the key integration: employee_provider supplies overlay text,
         which _dispatch_event places into channel_prompt (not into message text).
+        channel_prompt always includes NOHELLO_PROTOCOL; overlay is prepended
+        when present.
         """
         from nixi.gateway_adapter import NixiAdapter
+        from nixi.protocols import NOHELLO_PROTOCOL
 
         home = tmp_path / "hermes"
         emp_dir = home / "employees" / "U_OVERLAY"
@@ -175,7 +178,8 @@ class TestSafePathIntegration:
         with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
             asyncio.get_event_loop().run_until_complete(
                 adapter._dispatch_event(
-                    event_data={"event": {"text": "Hello agent", "channel": "C_INT"}},
+                    # DM message so classifier passes it (not dropped)
+                    event_data={"event": {"text": "Hello agent", "channel": "D_INT", "channel_type": "im"}},
                     user_id="U_OVERLAY",
                     user_name="OverlayUser",
                 )
@@ -186,8 +190,9 @@ class TestSafePathIntegration:
 
         assert len(captured_events) == 1
         event = captured_events[0]
-        # Overlay goes into channel_prompt, NOT into text
+        # Overlay and NOHELLO_PROTOCOL both go into channel_prompt, NOT into text
         assert "Employee Context" in event.channel_prompt
+        assert NOHELLO_PROTOCOL in event.channel_prompt
         assert event.text == "Hello agent"
 
 
@@ -390,8 +395,13 @@ class TestFullMessageFlow:
 
     @pytest.mark.asyncio
     async def test_valid_request_dispatches_event_with_overlay(self, tmp_path):
-        """Full flow: POST /nixi/event with valid auth → overlay loaded → MessageEvent dispatched."""
+        """Full flow: POST /nixi/event with valid auth → overlay loaded → MessageEvent dispatched.
+
+        Sends a DM (channel_type=im) so the classifier passes the message
+        rather than dropping it. channel_prompt contains overlay + NOHELLO_PROTOCOL.
+        """
         from nixi.gateway_adapter import NixiAdapter
+        from nixi.protocols import NOHELLO_PROTOCOL
 
         home = tmp_path / "hermes"
         emp_dir = home / "employees" / "U_FLOW"
@@ -425,7 +435,8 @@ class TestFullMessageFlow:
                     json={
                         "event": {
                             "text": "What's the deployment status?",
-                            "channel": "C_DEPLOY",
+                            "channel": "D_DEPLOY",
+                            "channel_type": "im",
                             "thread_ts": "1234567890.123456",
                         }
                     },
@@ -446,15 +457,16 @@ class TestFullMessageFlow:
         assert len(captured_events) == 1
         event = captured_events[0]
         assert event.text == "What's the deployment status?"
-        # Overlay must be in channel_prompt, NOT in message text
+        # Overlay and NOHELLO_PROTOCOL must be in channel_prompt, NOT in message text
         assert event.channel_prompt is not None
         assert "Employee Context" in event.channel_prompt
         assert "backend engineer" in event.channel_prompt
+        assert NOHELLO_PROTOCOL in event.channel_prompt
         # Verify source fields
         assert event.source.platform == Platform.NIXI
         assert event.source.user_id == "U_FLOW"
         assert event.source.user_name == "FlowUser"
-        assert event.source.chat_id == "C_DEPLOY"
+        assert event.source.chat_id == "D_DEPLOY"
         assert event.source.thread_id == "1234567890.123456"
 
     @pytest.mark.asyncio
@@ -527,9 +539,14 @@ class TestFullMessageFlow:
         adapter._message_handler.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_valid_request_with_empty_overlay_dispatches_with_none_prompt(self, tmp_path):
-        """When employee has no USER.md yet, overlay is empty, channel_prompt should be None."""
+    async def test_valid_request_with_empty_overlay_dispatches_with_protocol_only(self, tmp_path):
+        """When employee has no USER.md yet, overlay is empty, channel_prompt contains only NOHELLO_PROTOCOL.
+
+        _dispatch_event always injects NOHELLO_PROTOCOL into channel_prompt
+        even when no employee overlay exists.
+        """
         from nixi.gateway_adapter import NixiAdapter
+        from nixi.protocols import NOHELLO_PROTOCOL
 
         home = tmp_path / "hermes"
         home.mkdir()
@@ -548,7 +565,8 @@ class TestFullMessageFlow:
 
         with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
             await adapter._dispatch_event(
-                event_data={"event": {"text": "first message", "channel": "C_FIRST"}},
+                # DM message so classifier passes it (not dropped)
+                event_data={"event": {"text": "first message", "channel": "D_FIRST", "channel_type": "im"}},
                 user_id="U_NEW_EMPLOYEE",
                 user_name="NewEmployee",
             )
@@ -557,7 +575,8 @@ class TestFullMessageFlow:
 
         assert len(captured_events) == 1
         event = captured_events[0]
-        assert event.channel_prompt is None  # No overlay yet
+        # No overlay, but NOHELLO_PROTOCOL is always present
+        assert event.channel_prompt == NOHELLO_PROTOCOL
         assert event.text == "first message"
 
 
