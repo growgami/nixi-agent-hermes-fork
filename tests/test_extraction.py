@@ -811,3 +811,49 @@ class TestLLMClient:
         mock_resolve.assert_called_once_with("auto", model="gpt-4o", async_mode=True)
         # No _model attribute stored (BOB N2: only _resolved_model matters)
         assert not hasattr(llm, "_model")
+
+    def test_empty_model_raises_before_provider_resolution(self):
+        """LLMClient raises RuntimeError for empty extraction_model BEFORE resolve_provider_client is called.
+
+        This guards that no API key lookup (which may be slow or have side effects)
+        happens when the model is not configured.
+        """
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="",
+        )
+        with patch("nixi.extraction.batch.resolve_provider_client") as mock_resolve:
+            with pytest.raises(RuntimeError, match="No extraction model configured"):
+                LLMClient(config)
+            # resolve_provider_client must NEVER be called when model is empty
+            mock_resolve.assert_not_called()
+
+    def test_no_provider_error_includes_hermes_home_guidance(self, monkeypatch):
+        """LLMClient RuntimeError for missing provider includes HERMES_HOME context.
+
+        When called directly (programmatic path, no CLI/worker dotenv loading),
+        resolve_provider_client returns (None, None) because API keys aren't in
+        the environment. The error message must guide the user to set up .env.
+        """
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(None, None)):
+            with pytest.raises(RuntimeError, match="No LLM provider configured"):
+                LLMClient(config)
+
+    def test_no_provider_error_shows_hermes_home_when_set(self, monkeypatch):
+        """LLMClient RuntimeError message includes HERMES_HOME value when set."""
+        config = NixiConfig(
+            log_dir=Path("/tmp/logs"),
+            output_dir=Path("/tmp/output"),
+            extraction_model="gpt-4o",
+        )
+        monkeypatch.setenv("HERMES_HOME", "/custom/hermes/home")
+        with patch("nixi.extraction.batch.resolve_provider_client", return_value=(None, None)):
+            with pytest.raises(RuntimeError, match="/custom/hermes/home"):
+                LLMClient(config)
