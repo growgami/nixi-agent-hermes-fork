@@ -6,6 +6,7 @@ Built on gateway startup, refreshed periodically (every 5 min), and saved to
 action="list" and for resolving human-friendly channel names to numeric IDs.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -57,7 +58,7 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
 # Build / refresh
 # ---------------------------------------------------------------------------
 
-def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
+async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
     Build a channel directory from connected platform adapters and session data.
 
@@ -72,19 +73,46 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             if platform == Platform.DISCORD:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
-                platforms["slack"] = _build_slack(adapter)
+                platforms["slack"] = await _build_slack(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
     # Platforms that don't support direct channel enumeration get session-based
     # discovery automatically.  Skip infrastructure entries that aren't messaging
     # platforms — everything else falls through to _build_from_sessions().
-    _SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook"})
+    # "nixi" is handled below: in NIXI_MODE it mirrors "slack" plus session
+    # entries; without NIXI_MODE it should not appear at all.
+    _SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook", "nixi"})
     for plat in Platform:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
             continue
         platforms[plat_name] = _build_from_sessions(plat_name)
+
+    # In NIXI_MODE, Platform.NIXI is in adapters and Platform.SLACK may also be
+    # present.  Add a "nixi" section mirroring "slack" so that both nixi: and
+    # slack: prefixes resolve in send_message.
+    if Platform.NIXI in adapters and "slack" in platforms:
+        nixi_channels = []
+        slack_channels = platforms["slack"]
+        for ch in slack_channels:
+            nixi_ch = dict(ch)
+            # Session-based nixi entries may have names like "nixi/C0AE0QVNT1P" —
+            # strip the "nixi/" prefix so the name is a resolvable channel ID/name.
+            if nixi_ch.get("name", "").startswith("nixi/"):
+                nixi_ch["name"] = nixi_ch["name"].removeprefix("nixi/")
+            nixi_channels.append(nixi_ch)
+        # Also merge any session-based nixi entries that aren't in the slack list.
+        nixi_session = _build_from_sessions("nixi")
+        existing_ids = {ch["id"] for ch in nixi_channels}
+        for ch in nixi_session:
+            stripped_name = ch.get("name", "")
+            if stripped_name.startswith("nixi/"):
+                ch["name"] = stripped_name.removeprefix("nixi/")
+            if ch["id"] not in existing_ids:
+                nixi_channels.append(ch)
+                existing_ids.add(ch["id"])
+        platforms["nixi"] = nixi_channels
 
     directory = {
         "updated_at": datetime.now().isoformat(),
@@ -97,6 +125,25 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         logger.warning("Channel directory: failed to write: %s", e)
 
     return directory
+
+
+def build_channel_directory_sync(adapters: Dict[Any, Any], loop=None) -> Dict[str, Any]:
+    """Synchronous wrapper for build_channel_directory.
+
+    Used from threads that can't await (e.g. the cron ticker thread).
+    If *loop* is a running asyncio event loop, schedules the coroutine on it.
+    Otherwise, creates a fresh event loop via asyncio.run().
+    """
+    try:
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                build_channel_directory(adapters), loop,
+            )
+            return future.result(timeout=30)
+        return asyncio.run(build_channel_directory(adapters))
+    except Exception as e:
+        logger.warning("Channel directory: sync build failed: %s", e)
+        return {"updated_at": None, "platforms": {}}
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
@@ -136,21 +183,75 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
     return channels
 
 
-def _build_slack(adapter) -> List[Dict[str, str]]:
-    """List Slack channels the bot has joined."""
-    # Slack adapter may expose a web client
-    client = getattr(adapter, "_app", None) or getattr(adapter, "_client", None)
-    if not client:
+async def _build_slack(adapter) -> List[Dict[str, str]]:
+    """List Slack channels the bot has joined via conversations_list API.
+
+    In NIXI_MODE, uses ``_primary_client`` (AsyncWebClient).  In Socket Mode,
+    uses ``_app.client`` (accessed through the AsyncApp).  Falls back to
+    session data when no client is available or on ``missing_scope`` errors.
+    """
+    # Determine which Slack API client to use.
+    # NIXI_MODE: _primary_client is an AsyncWebClient set in _connect_nixi_mode().
+    # Socket Mode: _app is an AsyncApp — use _app.client for API calls.
+    client = getattr(adapter, "_primary_client", None)
+    if client is None:
+        app = getattr(adapter, "_app", None)
+        if app is not None:
+            client = getattr(app, "client", None)
+
+    if client is None:
         return _build_from_sessions("slack")
 
+    channels: List[Dict[str, str]] = []
     try:
-        from tools.send_message_tool import _send_slack  # noqa: F401
-        # Use the Slack Web API directly if available
-    except Exception:
-        pass
+        from slack_sdk.errors import SlackApiError
 
-    # Fallback to session data
-    return _build_from_sessions("slack")
+        cursor = None
+        max_channels = 1000
+        while len(channels) < max_channels:
+            resp = await client.conversations_list(
+                types="public_channel,private_channel",
+                limit=200,
+                cursor=cursor or "",
+            )
+            for ch in resp.get("channels", []):
+                channels.append({
+                    "id": ch["id"],
+                    "name": ch["name"],
+                    "is_private": ch.get("is_private", False),
+                    "type": "private_channel" if ch.get("is_private") else "channel",
+                })
+            # Pagination: continue if there's a next_cursor
+            metadata = resp.get("response_metadata", {})
+            next_cursor = metadata.get("next_cursor", "")
+            if not next_cursor:
+                break
+            cursor = next_cursor
+
+    except SlackApiError as e:
+        error_str = str(e)
+        if "missing_scope" in error_str or (hasattr(e, "response") and isinstance(e.response, dict) and e.response.get("error") == "missing_scope"):
+            logger.warning(
+                "Channel directory: Slack API missing_scope error (needs channels:read). "
+                "Falling back to session data.",
+            )
+        else:
+            logger.warning("Channel directory: Slack API error: %s. Falling back to session data.", e)
+        return _build_from_sessions("slack")
+    except Exception as e:
+        logger.warning("Channel directory: failed to enumerate Slack channels: %s. Falling back to session data.", e)
+        return _build_from_sessions("slack")
+
+    # Merge session data — add any channels from sessions that aren't already
+    # in the API results (deduplicate by ID).
+    session_channels = _build_from_sessions("slack")
+    existing_ids = {ch["id"] for ch in channels}
+    for ch in session_channels:
+        if ch["id"] not in existing_ids:
+            channels.append(ch)
+            existing_ids.add(ch["id"])
+
+    return channels
 
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
@@ -209,22 +310,24 @@ def lookup_channel_type(platform_name: str, chat_id: str) -> Optional[str]:
     return None
 
 
-def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
+# nixi and slack share the same channel directory data — each can
+# fall back to the other when the primary section has no match.
+_PLATFORM_ALIAS = {
+    "nixi": "slack",
+    "slack": "nixi",
+}
+
+
+def _resolve_in_channels(
+    platform_name: str,
+    channels: List[Dict[str, Any]],
+    query: str,
+) -> Optional[str]:
+    """Try to resolve *query* against *channels* for *platform_name*.
+
+    This is the inner matching loop extracted from ``resolve_channel_name``
+    so it can be reused for cross-platform aliasing.
     """
-    Resolve a human-friendly channel name to a numeric ID.
-
-    Matching strategy (case-insensitive, first match wins):
-    - Discord: "bot-home", "#bot-home", "GuildName/bot-home"
-    - Telegram: display name or group name
-    - Slack: "engineering", "#engineering"
-    """
-    directory = load_directory()
-    channels = directory.get("platforms", {}).get(platform_name, [])
-    if not channels:
-        return None
-
-    query = _normalize_channel_query(name)
-
     # 1. Exact name match, including the display labels shown by send_message(action="list")
     for ch in channels:
         if _normalize_channel_query(ch["name"]) == query:
@@ -244,6 +347,42 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
     if len(matches) == 1:
         return matches[0]["id"]
+
+    return None
+
+
+def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
+    """
+    Resolve a human-friendly channel name to a numeric ID.
+
+    Matching strategy (case-insensitive, first match wins):
+    - Discord: "bot-home", "#bot-home", "GuildName/bot-home"
+    - Telegram: display name or group name
+    - Slack: "engineering", "#engineering"
+
+    Cross-platform aliasing: "nixi" and "slack" fall back to each other
+    when no match is found in the primary section.
+    """
+    directory = load_directory()
+    all_platforms = directory.get("platforms", {})
+    channels = all_platforms.get(platform_name, [])
+
+    query = _normalize_channel_query(name)
+
+    # Try the requested platform section first.
+    if channels:
+        result = _resolve_in_channels(platform_name, channels, query)
+        if result is not None:
+            return result
+
+    # Cross-platform fallback: nixi ↔ slack
+    alias = _PLATFORM_ALIAS.get(platform_name)
+    if alias:
+        alias_channels = all_platforms.get(alias, [])
+        if alias_channels:
+            result = _resolve_in_channels(alias, alias_channels, query)
+            if result is not None:
+                return result
 
     return None
 

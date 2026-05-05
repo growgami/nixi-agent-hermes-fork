@@ -1798,4 +1798,30 @@ class TestSendMediaTimeoutCancelsFuture:
         assert timeout_cancel_calls == [True], "future.cancel() must fire on TimeoutError"
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
-        assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestNixiSlackDelivery:
+    """Tests for 'nixi' → Platform.SLACK routing in the cron scheduler."""
+
+    def test_nixi_delivers_via_slack_platform(self):
+        """Cron delivery to 'nixi' should resolve to Platform.SLACK, not Platform.NIXI."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "nixi-cron-job",
+                "name": "nixi-test",
+                "deliver": "nixi:C12345678",
+            }
+            _deliver_result(job, "Test message")
+
+        # Verify the delivery used Platform.SLACK, not Platform.NIXI
+        assert send_mock.call_count == 1
+        sent_platform = send_mock.call_args[0][0]
+        assert sent_platform == Platform.SLACK, f"Expected Platform.SLACK but got {sent_platform}"

@@ -170,12 +170,20 @@ def _handle_send(args):
         is_explicit = False
 
     # Resolve human-friendly channel names to numeric IDs
+    # "nixi" targets use Slack's channel directory for name resolution.
+    directory_platform = "slack" if platform_name == "nixi" else platform_name
     if target_ref and not is_explicit:
         try:
             from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
+            resolved = resolve_channel_name(directory_platform, target_ref)
             if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                parsed_id, parsed_tid, parsed_explicit = _parse_target_ref(platform_name, resolved)
+                if parsed_id is not None:
+                    chat_id, thread_id = parsed_id, parsed_tid
+                else:
+                    # Resolved ID is not in a recognized explicit format (e.g. Slack's
+                    # "C12345678") — use the resolved string directly as chat_id.
+                    chat_id, thread_id = resolved, None
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
@@ -215,6 +223,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "nixi": Platform.SLACK,
     }
     platform = platform_map.get(platform_name)
     if not platform:
