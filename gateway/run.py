@@ -10009,9 +10009,96 @@ class GatewayRunner:
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            # ── Task-boundary callbacks for streaming TaskCards ──────────────
+            # Wire tool lifecycle events to the stream consumer's
+            # emit_task_start/complete/error methods.  Each callback builds
+            # a pre-built chunk dict via slack_chunks.make_task_update() and
+            # passes it to the consumer.  The consumer does NOT import
+            # slack_chunks and has no Slack-specific knowledge.
+            _URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
+
+            def _task_start_callback(task_id: str, tool_name: str, args: dict = None) -> None:
+                if not _run_still_current():
+                    return
+                if _stream_consumer is None:
+                    return
+                if not hasattr(_stream_consumer, 'emit_task_start'):
+                    return
+                try:
+                    from gateway.platforms.slack_chunks import make_task_update
+                    chunk = make_task_update(
+                        id=task_id,
+                        title=tool_name,
+                        status="in_progress",
+                    )
+                    _stream_consumer.emit_task_start(task_id, tool_name, task_chunk=chunk)
+                except Exception as _e:
+                    logger.debug("task_start_callback error: %s", _e)
+
+            def _task_complete_callback(
+                task_id: str, tool_name: str, args: dict = None, result: str = None,
+            ) -> None:
+                if not _run_still_current():
+                    return
+                if _stream_consumer is None:
+                    return
+                # Determine error vs complete status
+                # Use the same heuristic as the CLI's tool result display
+                is_error = False
+                if result:
+                    try:
+                        from agent.display import _detect_tool_failure
+                        is_error, _ = _detect_tool_failure(tool_name, result)
+                    except Exception:
+                        # Fallback: simple prefix check
+                        is_error = result.startswith("Error")
+
+                # Use tool result as output (slack_chunks.make_task_update
+                # truncates to 256 chars with "…" suffix per Task 4).
+                output_summary = result or ""
+
+                # Extract URLs from the result for source links
+                sources = []
+                if result:
+                    try:
+                        from gateway.platforms.slack_chunks import make_url_source
+                        for _url_match in _URL_RE.finditer(result):
+                            _url = _url_match.group(0).rstrip(".,;:!?")
+                            sources.append(make_url_source(text=_url, url=_url))
+                            if len(sources) >= 3:
+                                break
+                    except Exception:
+                        pass
+
+                try:
+                    from gateway.platforms.slack_chunks import make_task_update
+                    if is_error:
+                        chunk = make_task_update(
+                            id=task_id,
+                            title=tool_name,
+                            status="error",
+                            details=output_summary,
+                        )
+                        if hasattr(_stream_consumer, 'emit_task_error'):
+                            _stream_consumer.emit_task_error(task_id, task_chunk=chunk)
+                    else:
+                        chunk = make_task_update(
+                            id=task_id,
+                            title=tool_name,
+                            status="complete",
+                            output=output_summary,
+                            sources=sources if sources else None,
+                        )
+                        if hasattr(_stream_consumer, 'emit_task_complete'):
+                            _stream_consumer.emit_task_complete(task_id, task_chunk=chunk)
+                except Exception as _e:
+                    logger.debug("task_complete_callback error: %s", _e)
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_start_callback = _task_start_callback
+            agent.tool_complete_callback = _task_complete_callback
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
