@@ -908,6 +908,12 @@ class SessionStore:
                 self._db.end_session(db_end_session_id, "session_reset")
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
+            # Clean up thread memory for the old session on auto-reset
+            # so stale conversation context doesn't bleed into the new session.
+            try:
+                self._db.delete_thread_memory(session_key)
+            except Exception as e:
+                logger.debug("Thread memory cleanup failed for session_key=%s: %s", session_key, e)
 
         if self._db and db_create_kwargs:
             try:
