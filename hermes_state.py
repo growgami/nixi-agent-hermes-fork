@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -95,6 +95,26 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS thread_memory (
+    session_key TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_key, key)
+);
+
+CREATE TABLE IF NOT EXISTS user_memory (
+    user_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT,
+    PRIMARY KEY (user_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_memory_expires ON user_memory(expires_at);
+CREATE INDEX IF NOT EXISTS idx_thread_memory_session ON thread_memory(session_key);
 """
 
 FTS_SQL = """
@@ -356,6 +376,37 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 8")
+            if current_version < 9:
+                # v9: add thread_memory and user_memory tables for agent
+                # working memory. Key-value rows with INSERT OR REPLACE semantics.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS thread_memory (
+                        session_key TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (session_key, key)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_memory (
+                        user_id TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        expires_at TEXT,
+                        PRIMARY KEY (user_id, key)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_thread_memory_session
+                    ON thread_memory(session_key)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_user_memory_expires
+                    ON user_memory(expires_at)
+                """)
+                cursor.execute("UPDATE schema_version SET version = 9")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -1561,6 +1612,119 @@ class SessionDB:
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
+            )
+        self._execute_write(_do)
+
+    # ── Memory (thread + user key-value stores) ──
+
+    @staticmethod
+    def _iso_now() -> str:
+        """Return current UTC time as ISO-8601 string."""
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
+
+    def get_thread_memory(self, session_key: str) -> List[tuple]:
+        """Return all (key, value) pairs for the given session_key.
+
+        Returns an empty list if no rows exist.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT key, value FROM thread_memory WHERE session_key = ? ORDER BY key",
+                (session_key,),
+            )
+            return [(row["key"], row["value"]) for row in cursor.fetchall()]
+
+    def set_thread_memory(self, session_key: str, key: str, value: str) -> None:
+        """Upsert a single thread-memory row. Uses INSERT OR REPLACE."""
+        now = self._iso_now()
+
+        def _do(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO thread_memory (session_key, key, value, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_key, key, value, now),
+            )
+        self._execute_write(_do)
+
+    def delete_thread_memory_key(self, session_key: str, key: str) -> None:
+        """Delete a single thread-memory row by (session_key, key)."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM thread_memory WHERE session_key = ? AND key = ?",
+                (session_key, key),
+            )
+        self._execute_write(_do)
+
+    def delete_thread_memory(self, session_key: str) -> None:
+        """Delete all thread-memory rows for the given session_key."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM thread_memory WHERE session_key = ?",
+                (session_key,),
+            )
+        self._execute_write(_do)
+
+    def get_user_memory(self, user_id: str) -> List[tuple]:
+        """Return all non-expired (key, value) pairs for the given user.
+
+        Lazy-deletes expired rows on read. Returns an empty list if no
+        active rows exist.
+        """
+        now = self._iso_now()
+
+        # Lazy delete expired rows first
+        def _cleanup(conn):
+            conn.execute(
+                "DELETE FROM user_memory WHERE user_id = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+                (user_id, now),
+            )
+        self._execute_write(_cleanup)
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT key, value FROM user_memory WHERE user_id = ? "
+                "AND (expires_at IS NULL OR expires_at > ?) ORDER BY key",
+                (user_id, now),
+            )
+            return [(row["key"], row["value"]) for row in cursor.fetchall()]
+
+    def set_user_memory(
+        self, user_id: str, key: str, value: str, ttl_hours: float = None
+    ) -> None:
+        """Upsert a single user-memory row. If ttl_hours is provided,
+        computes expires_at from now. Uses INSERT OR REPLACE."""
+        from datetime import datetime, timezone, timedelta
+
+        now = datetime.now(timezone.utc)
+        updated_at = now.isoformat()
+        expires_at = None
+        if ttl_hours is not None:
+            expires_at = (now + timedelta(hours=ttl_hours)).isoformat()
+
+        def _do(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO user_memory (user_id, key, value, updated_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, key, value, updated_at, expires_at),
+            )
+        self._execute_write(_do)
+
+    def delete_user_memory(self, user_id: str, key: str) -> None:
+        """Delete a single user-memory row by (user_id, key)."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM user_memory WHERE user_id = ? AND key = ?",
+                (user_id, key),
+            )
+        self._execute_write(_do)
+
+    def delete_all_user_memory(self, user_id: str) -> None:
+        """Delete all user-memory rows for the given user_id."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM user_memory WHERE user_id = ?",
+                (user_id,),
             )
         self._execute_write(_do)
 
