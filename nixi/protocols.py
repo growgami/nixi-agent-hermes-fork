@@ -6,8 +6,11 @@ patterns without requiring the classifier to produce response text directly.
 """
 
 NOHELLO_PROTOCOL: str = (
-    "When a user sends a greeting-only message (just 'hi', 'hey', "
-    "'hello', or similar with no substantive request), respond with "
-    "only: https://nohello.net — no explanation, no follow-up question, "
-    "no additional text."
+    "When a user sends a greeting-only message — meaning ONLY a greeting "
+    "word with zero additional content (e.g. 'hi', 'hey', 'hello', 'nixi', "
+    "'hey nixi') — respond with only: https://nohello.net — no explanation, "
+    "no follow-up question, no additional text. "
+    "Do NOT apply this to messages with conversational follow-up like "
+    "'how are you', 'what's up', or 'how's it going' — those are social "
+    "openers, not greeting-only messages. Respond to social openers normally."
 )
