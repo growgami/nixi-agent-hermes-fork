@@ -2041,6 +2041,30 @@ class TestProgressMessageThread:
         )
         assert msg_event.message_id == "2000000000.000001"
 
+    @pytest.mark.asyncio
+    async def test_build_source_propagates_message_id(self, adapter):
+        """source.message_id must equal the Slack message ts so run.py can read it
+        for _thread_metadata fallback (Bug: build_source() was not passing message_id=ts)."""
+        event = {
+            "channel": "C_CHAN",
+            "channel_type": "channel",
+            "user": "U_USER",
+            "text": "<@U_BOT> hello",
+            "ts": "3000000000.000001",
+        }
+        captured_events = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured_events.append(e))
+
+        with patch.object(adapter, "_resolve_user_name", new=AsyncMock(return_value="testuser")):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured_events) == 1
+        source = captured_events[0].source
+        assert source.message_id == "3000000000.000001", (
+            "source.message_id must equal the event ts; "
+            "build_source() must propagate message_id=ts"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestNixiSendOnlyMode

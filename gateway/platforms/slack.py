@@ -1620,6 +1620,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            message_id=ts,  # Both source and msg_event set message_id=ts — redundant by design
         )
 
         # Per-channel ephemeral prompt
