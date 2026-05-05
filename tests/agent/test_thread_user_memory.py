@@ -3,7 +3,6 @@
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock
 
 from hermes_state import SessionDB
 from agent.thread_user_memory import ThreadUserMemoryManager
