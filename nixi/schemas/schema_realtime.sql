@@ -1,5 +1,5 @@
 -- DDL for realtime_messages table in nixi_state.db.
--- Mirrors the schema defined in infra/ingester/schema.sql.
+-- Mirrors the schema defined in infra/sludge/ingester/schema.sql.
 -- The Go ingester is the sole writer; the Python extraction pipeline reads.
 -- team_id is nullable — some Socket Mode events may not include it.
 

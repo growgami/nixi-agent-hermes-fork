@@ -431,7 +431,7 @@ class TestEnsureRealtimeSchema:
         conn.close()
 
     def test_realtime_schema_matches_ingester_schema(self, db_path: Path):
-        """schema_realtime.sql produces identical schema to infra/ingester/schema.sql."""
+        """schema_realtime.sql produces identical schema to infra/sludge/ingester/schema.sql."""
         from nixi.db import ensure_realtime_schema
         ensure_realtime_schema(db_path)
         conn = get_connection(db_path)
