@@ -137,6 +137,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Used for chat_appendStream / chat_stopStream calls AND for fallback
         # edit targeting when streaming fails mid-stream.
         self._active_stream_ts: Dict[str, str] = {}
+        # Per-chat task display mode for chat.startStream task_display_mode param.
+        # Keyed by chat_id, consistent with _active_stream_ts pattern.
+        self._task_display_mode: Dict[str, str] = {}
         # chat_ids where streaming failed due to missing scope/auth.
         # Persists for adapter lifetime (process lifetime). Won't self-heal;
         # agent process must be restarted after scope fix (S-NEW-3).
@@ -695,7 +698,7 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                 )
 
-    async def start_stream(self, chat_id: str, metadata=None) -> Optional[str]:
+    async def start_stream(self, chat_id: str, metadata=None, *, task_display_mode: Optional[str] = None) -> Optional[str]:
         """Start a native Slack streaming session via chat.startStream.
 
         Returns the message ts from the startStream response on success,
@@ -704,6 +707,13 @@ class SlackAdapter(BasePlatformAdapter):
         The ts is stored in _active_stream_ts for subsequent
         chat_appendStream / chat_stopStream calls and for fallback edit
         targeting if streaming fails mid-stream.
+
+        Args:
+            chat_id: Slack channel ID.
+            metadata: Optional dict with thread_id, message_id, user_id.
+            task_display_mode: Optional display mode for Thinking Steps.
+                Must be ``"plan"`` or ``"timeline"``; invalid values are
+                logged as WARNING and ignored.
         """
         if not self._app and not self._primary_client:
             return None
@@ -722,6 +732,17 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] start_stream: no thread_ts resolvable for %s", chat_id)
             return None  # B1 — can't start stream without thread anchor
 
+        # Validate task_display_mode
+        if task_display_mode is not None:
+            if task_display_mode not in ("plan", "timeline"):
+                logger.warning(
+                    "[Slack] start_stream: invalid task_display_mode %r for %s — expected 'plan' or 'timeline'",
+                    task_display_mode, chat_id,
+                )
+                task_display_mode = None  # ignore invalid, proceed without
+            else:
+                self._task_display_mode[chat_id] = task_display_mode
+
         recipient_team_id = self._channel_team.get(chat_id)
         recipient_user_id = (metadata or {}).get("user_id") if metadata else None
 
@@ -734,6 +755,8 @@ class SlackAdapter(BasePlatformAdapter):
                 kwargs["recipient_team_id"] = recipient_team_id
             if recipient_user_id:
                 kwargs["recipient_user_id"] = recipient_user_id
+            if task_display_mode is not None:
+                kwargs["task_display_mode"] = task_display_mode
 
             response = await self._get_client(chat_id).chat_startStream(**kwargs)
             message_ts = response.get("ts")
@@ -760,7 +783,7 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.warning("[Slack] start_stream failed for %s: %s", chat_id, e)
             return None
 
-    async def append_stream(self, chat_id: str, text: str, metadata=None) -> bool:
+    async def append_stream(self, chat_id: str, text: str, metadata=None, *, chunks: Optional[list] = None) -> bool:
         """Append incremental text to an active Slack streaming message.
 
         Sends only the delta (new text since last append) via
@@ -770,6 +793,16 @@ class SlackAdapter(BasePlatformAdapter):
         The text parameter should be the raw delta text (not accumulated),
         already cleaned by _clean_for_display upstream (S-NEW-2).  No
         format_message() is applied here (S5).
+
+        Args:
+            chat_id: Slack channel ID.
+            text: Delta markdown text to append.
+            metadata: Optional dict with thread_id, message_id.
+            chunks: Optional list of chunk dicts for Thinking Steps.
+                When provided, ``markdown_text`` is omitted from the API
+                call and the chunks array is sent instead.  If ``text``
+                is non-empty, it is wrapped as a ``markdown_text`` chunk
+                and prepended to the chunks array.
         """
         message_ts = self._active_stream_ts.get(chat_id)
         if not message_ts:
@@ -784,10 +817,17 @@ class SlackAdapter(BasePlatformAdapter):
             kwargs = {
                 "channel": chat_id,
                 "ts": message_ts,
-                "markdown_text": text,
             }
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
+
+            if chunks is not None:
+                if text.strip():
+                    from gateway.platforms.slack_chunks import make_markdown_chunk
+                    chunks = [make_markdown_chunk(text)] + chunks
+                kwargs["chunks"] = chunks
+            else:
+                kwargs["markdown_text"] = text
 
             await self._get_client(chat_id).chat_appendStream(**kwargs)
             return True
@@ -801,11 +841,15 @@ class SlackAdapter(BasePlatformAdapter):
         """Stop an active Slack streaming session via chat.stopStream.
 
         Returns True on success, False on failure or if no active stream.
-        Also clears the typing indicator if one was active.
+        Also clears the typing indicator if one was active and resets
+        the per-chat task_display_mode.
         """
         message_ts = self._active_stream_ts.pop(chat_id, None)
         if not message_ts:
             return False
+
+        # Reset per-chat task_display_mode
+        self._task_display_mode.pop(chat_id, None)
 
         try:
             await self._get_client(chat_id).chat_stopStream(

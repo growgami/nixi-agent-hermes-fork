@@ -1219,3 +1219,260 @@ class TestHealthMonitor:
         assert adapter.has_fatal_error is True
         assert adapter._fatal_error_code == "socket_mode_dead"
         assert adapter._fatal_error_retryable is True
+
+
+# ---------------------------------------------------------------------------
+# Task 5: task_display_mode and chunks parameter tests
+# ---------------------------------------------------------------------------
+
+
+class TestTaskDisplayMode:
+    """Verify task_display_mode support in start_stream / stop_stream."""
+
+    @pytest.mark.asyncio
+    async def test_start_stream_task_display_mode_plan(self):
+        """start_stream(task_display_mode='plan') passes mode to API and stores per-chat_id."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_mode"})
+
+        metadata = {"thread_id": "111.222"}
+        result = await adapter.start_stream("C_CHAN", metadata=metadata, task_display_mode="plan")
+
+        assert result == "ts_mode"
+        assert adapter._task_display_mode["C_CHAN"] == "plan"
+        call_kwargs = mock_client.chat_startStream.call_args[1]
+        assert call_kwargs["task_display_mode"] == "plan"
+
+    @pytest.mark.asyncio
+    async def test_start_stream_task_display_mode_timeline(self):
+        """start_stream(task_display_mode='timeline') passes mode to API."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_tl"})
+
+        metadata = {"thread_id": "111.222"}
+        result = await adapter.start_stream("C_CHAN", metadata=metadata, task_display_mode="timeline")
+
+        assert result == "ts_tl"
+        assert adapter._task_display_mode["C_CHAN"] == "timeline"
+        call_kwargs = mock_client.chat_startStream.call_args[1]
+        assert call_kwargs["task_display_mode"] == "timeline"
+
+    @pytest.mark.asyncio
+    async def test_start_stream_task_display_mode_invalid_logs_warning(self):
+        """start_stream(task_display_mode='invalid') logs WARNING and ignores."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_inv"})
+
+        metadata = {"thread_id": "111.222"}
+        with patch("gateway.platforms.slack.logger") as mock_logger:
+            result = await adapter.start_stream("C_CHAN", metadata=metadata, task_display_mode="bogus")
+
+        assert result == "ts_inv"
+        # Mode should NOT be stored — invalid ignored
+        assert "C_CHAN" not in adapter._task_display_mode
+        # task_display_mode should NOT be passed to API
+        call_kwargs = mock_client.chat_startStream.call_args[1]
+        assert "task_display_mode" not in call_kwargs
+        # WARNING logged
+        mock_logger.warning.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_start_stream_task_display_mode_none_omits_key(self):
+        """start_stream(task_display_mode=None) does not pass task_display_mode to API."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        mock_client.chat_startStream = AsyncMock(return_value={"ts": "ts_none"})
+
+        metadata = {"thread_id": "111.222"}
+        result = await adapter.start_stream("C_CHAN", metadata=metadata)
+
+        assert result == "ts_none"
+        call_kwargs = mock_client.chat_startStream.call_args[1]
+        assert "task_display_mode" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_stop_stream_resets_task_display_mode(self):
+        """stop_stream(chat_id) pops _task_display_mode[chat_id]."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_stop"
+        adapter._task_display_mode["C_CHAN"] = "plan"
+
+        mock_client.chat_stopStream = AsyncMock(return_value={})
+
+        result = await adapter.stop_stream("C_CHAN")
+
+        assert result is True
+        assert "C_CHAN" not in adapter._task_display_mode
+
+    @pytest.mark.asyncio
+    async def test_task_display_mode_per_chat_isolation(self):
+        """Two concurrent streams with different modes don't interfere."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        # Set up two workspace clients
+        client_a = AsyncMock()
+        client_b = AsyncMock()
+        client_a.chat_startStream = AsyncMock(return_value={"ts": "ts_a"})
+        client_b.chat_startStream = AsyncMock(return_value={"ts": "ts_b"})
+        adapter._team_clients = {"T_A": client_a, "T_B": client_b}
+        adapter._channel_team = {"C_A": "T_A", "C_B": "T_B"}
+
+        metadata_a = {"thread_id": "111.222"}
+        metadata_b = {"thread_id": "333.444"}
+
+        # Start with different modes
+        await adapter.start_stream("C_A", metadata=metadata_a, task_display_mode="plan")
+        await adapter.start_stream("C_B", metadata=metadata_b, task_display_mode="timeline")
+
+        assert adapter._task_display_mode["C_A"] == "plan"
+        assert adapter._task_display_mode["C_B"] == "timeline"
+
+        # Verify each was passed to correct API call
+        call_a = client_a.chat_startStream.call_args[1]
+        call_b = client_b.chat_startStream.call_args[1]
+        assert call_a["task_display_mode"] == "plan"
+        assert call_b["task_display_mode"] == "timeline"
+
+
+class TestAppendStreamChunks:
+    """Verify append_stream chunks parameter behavior."""
+
+    @pytest.mark.asyncio
+    async def test_case1_chunks_none_sends_markdown_text(self):
+        """Case 1: chunks=None → send markdown_text=text (existing path)."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_app"
+
+        mock_client.chat_appendStream = AsyncMock(return_value={})
+
+        result = await adapter.append_stream("C_CHAN", "delta text", metadata={"thread_id": "111.222"})
+
+        assert result is True
+        call_kwargs = mock_client.chat_appendStream.call_args[1]
+        assert call_kwargs["markdown_text"] == "delta text"
+        assert "chunks" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_case2_chunks_with_truthy_text_prepends_markdown_chunk(self):
+        """Case 2: chunks provided AND text.strip() truthy → prepend markdown chunk, omit markdown_text."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_app"
+
+        mock_client.chat_appendStream = AsyncMock(return_value={})
+
+        task_chunk = {"type": "task_update", "id": "t1", "title": "Task", "status": "in_progress"}
+        result = await adapter.append_stream(
+            "C_CHAN", "intro delta", metadata={"thread_id": "111.222"},
+            chunks=[task_chunk],
+        )
+
+        assert result is True
+        call_kwargs = mock_client.chat_appendStream.call_args[1]
+        # markdown_text should NOT be in kwargs
+        assert "markdown_text" not in call_kwargs
+        # chunks should be present with markdown chunk prepended
+        assert "chunks" in call_kwargs
+        chunks = call_kwargs["chunks"]
+        assert len(chunks) == 2
+        # First chunk is the markdown_text wrapper
+        assert chunks[0]["type"] == "markdown_text"
+        assert chunks[0]["text"] == "intro delta"
+        # Second chunk is the original task chunk
+        assert chunks[1] == task_chunk
+
+    @pytest.mark.asyncio
+    async def test_case3_chunks_with_falsy_text_sends_chunks_only(self):
+        """Case 3: chunks provided AND text.strip() falsy → send chunks only, omit markdown_text."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_app"
+
+        mock_client.chat_appendStream = AsyncMock(return_value={})
+
+        task_chunk = {"type": "task_update", "id": "t1", "title": "Task", "status": "in_progress"}
+
+        # Test with empty string
+        result = await adapter.append_stream(
+            "C_CHAN", "", metadata={"thread_id": "111.222"},
+            chunks=[task_chunk],
+        )
+
+        assert result is True
+        call_kwargs = mock_client.chat_appendStream.call_args[1]
+        assert "markdown_text" not in call_kwargs
+        assert "chunks" in call_kwargs
+        chunks = call_kwargs["chunks"]
+        assert len(chunks) == 1
+        assert chunks[0] == task_chunk
+
+    @pytest.mark.asyncio
+    async def test_case3_whitespace_only_text_with_chunks(self):
+        """Case 3 variant: whitespace-only text.strip() is falsy → no markdown chunk prepended."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_app"
+
+        mock_client.chat_appendStream = AsyncMock(return_value={})
+
+        task_chunk = {"type": "task_update", "id": "t1", "title": "Task", "status": "in_progress"}
+        result = await adapter.append_stream(
+            "C_CHAN", "   \n  ", metadata={"thread_id": "111.222"},
+            chunks=[task_chunk],
+        )
+
+        assert result is True
+        call_kwargs = mock_client.chat_appendStream.call_args[1]
+        assert "markdown_text" not in call_kwargs
+        assert len(call_kwargs["chunks"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_chunks_failure_falls_through_to_edit(self):
+        """append_stream(chunks=...) failure follows existing streaming failure fallback."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_app"
+
+        mock_client.chat_appendStream = AsyncMock(
+            side_effect=Exception("API error with chunks")
+        )
+
+        task_chunk = {"type": "task_update", "id": "t1", "title": "Task", "status": "in_progress"}
+        result = await adapter.append_stream(
+            "C_CHAN", "delta", metadata={"thread_id": "111.222"},
+            chunks=[task_chunk],
+        )
+
+        assert result is False
+        assert "C_CHAN" not in adapter._active_stream_ts
+
+    @pytest.mark.asyncio
+    async def test_chunks_multiple_items(self):
+        """Multiple chunks array preserves order with markdown chunk at front when text is truthy."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+        adapter._active_stream_ts["C_CHAN"] = "ts_app"
+
+        mock_client.chat_appendStream = AsyncMock(return_value={})
+
+        chunk1 = {"type": "task_update", "id": "t1", "title": "First", "status": "pending"}
+        chunk2 = {"type": "plan_update", "title": "Plan"}
+        result = await adapter.append_stream(
+            "C_CHAN", "some text", metadata={"thread_id": "111.222"},
+            chunks=[chunk1, chunk2],
+        )
+
+        assert result is True
+        call_kwargs = mock_client.chat_appendStream.call_args[1]
+        chunks = call_kwargs["chunks"]
+        assert len(chunks) == 3
+        assert chunks[0]["type"] == "markdown_text"
+        assert chunks[0]["text"] == "some text"
+        assert chunks[1] == chunk1
+        assert chunks[2] == chunk2
