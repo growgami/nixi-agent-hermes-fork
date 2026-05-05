@@ -123,6 +123,15 @@ class GatewayStreamConsumer:
         # so we only send new text, not the full accumulated buffer.
         self._last_streamed_len: int = 0
 
+        # TaskCard tracking state — tool-boundary task_update chunk emission.
+        # _pending_task_chunks stores pre-built dict objects; the consumer
+        # does NOT import slack_chunks and has no Slack-specific knowledge.
+        # run.py builds chunk dicts via slack_chunks.make_task_update and
+        # passes them to emit_task_start/complete/error.
+        self._active_task_id: Optional[str] = None
+        self._active_task_title: Optional[str] = None
+        self._pending_task_chunks: list[dict] = []
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -152,6 +161,39 @@ class GatewayStreamConsumer:
         if text:
             self._queue.put((_COMMENTARY, text))
 
+    def emit_task_start(self, task_id: str, title: str, *, task_chunk: dict) -> None:
+        """Queue a task_update chunk (status=in_progress) for the next append.
+
+        task_chunk: pre-built dict from run.py (via slack_chunks.make_task_update).
+                    Consumer does NOT import slack_chunks and does NOT build chunks.
+        """
+        if self._active_task_id is not None:
+            logger.warning(
+                "Overlapping task: %s (%s) still active when new task %s (%s) started",
+                self._active_task_id, self._active_task_title, task_id, title,
+            )
+        self._active_task_id = task_id
+        self._active_task_title = title
+        self._pending_task_chunks.append(task_chunk)
+
+    def emit_task_complete(self, task_id: str, *, task_chunk: dict) -> None:
+        """Queue a task_update chunk (status=complete) for the next append.
+
+        task_chunk: pre-built dict from run.py (via slack_chunks.make_task_update).
+        """
+        self._pending_task_chunks.append(task_chunk)
+        self._active_task_id = None
+        self._active_task_title = None
+
+    def emit_task_error(self, task_id: str, *, task_chunk: dict) -> None:
+        """Queue a task_update chunk (status=error) for the next append.
+
+        task_chunk: pre-built dict from run.py (via slack_chunks.make_task_update).
+        """
+        self._pending_task_chunks.append(task_chunk)
+        self._active_task_id = None
+        self._active_task_title = None
+
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
@@ -163,6 +205,9 @@ class GatewayStreamConsumer:
         # Reset native streaming state for the new segment
         self._native_streaming = False
         self._last_streamed_len = 0
+        # Flush pending task chunks at segment boundary. Active task
+        # state persists across segments (a tool call spans segments).
+        self._pending_task_chunks = []
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -410,6 +455,16 @@ class GatewayStreamConsumer:
                     # chat.stopStream and skip ALL remaining got_done logic.
                     # The streaming message was already finalized by the API.
                     if self._native_streaming:
+                        # Flush remaining pending task chunks before stop_stream.
+                        if self._pending_task_chunks:
+                            try:
+                                await self.adapter.append_stream(
+                                    self.chat_id, "", metadata=self.metadata,
+                                    chunks=self._pending_task_chunks.copy(),
+                                )
+                            except Exception:
+                                pass  # best-effort flush before stop
+                            self._pending_task_chunks.clear()
                         await self.adapter.stop_stream(
                             self.chat_id, metadata=self.metadata,
                         )
@@ -816,8 +871,14 @@ class GatewayStreamConsumer:
             # Subsequent sends — compute and send only the delta (S-1)
             delta = text[self._last_streamed_len:]
             if delta:
+                # Flush pending task chunks alongside the text delta.
+                # Chunks and text are packed into a single appendStream call
+                # (Case 2/3 from Task 5). When no chunks are pending,
+                # chunks=None → existing markdown_text path (Case 1).
+                chunks = self._pending_task_chunks.copy() if self._pending_task_chunks else None
+                self._pending_task_chunks.clear()
                 ok = await self.adapter.append_stream(
-                    self.chat_id, delta, metadata=self.metadata,
+                    self.chat_id, delta, metadata=self.metadata, chunks=chunks,
                 )
                 if ok:
                     self._last_streamed_len = len(text)
@@ -844,10 +905,13 @@ class GatewayStreamConsumer:
                 self._message_id = message_ts  # B-NEW-2
                 self._already_sent = True  # stream counts as delivery
                 self._last_streamed_len = 0  # S-1 reset delta tracker
-                # Send the initial text as the first append
+                # Send the initial text as the first append, flushing
+                # any pending task chunks alongside it.
                 if text.strip():
+                    chunks = self._pending_task_chunks.copy() if self._pending_task_chunks else None
+                    self._pending_task_chunks.clear()
                     ok = await self.adapter.append_stream(
-                        self.chat_id, text, metadata=self.metadata,
+                        self.chat_id, text, metadata=self.metadata, chunks=chunks,
                     )
                     if ok:
                         self._last_streamed_len = len(text)

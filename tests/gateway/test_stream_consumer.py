@@ -1,6 +1,7 @@
 """Tests for GatewayStreamConsumer — media directive stripping in streaming."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1337,3 +1338,220 @@ class TestCursorStrippingOnFallback:
         assert consumer._already_sent is True
         # _last_sent_text must NOT be updated when the edit failed
         assert consumer._last_sent_text == "Hello ▉"
+
+
+# ── TaskCard emission tests (Task 6) ──────────────────────────────────────
+
+
+class TestTaskCardEmissionMethods:
+    """Verify emit_task_start/complete/error queue chunks for flush."""
+
+    def test_emit_task_start_queues_chunk(self):
+        """emit_task_start stores task_id, title, and appends the chunk dict."""
+        c = _make_consumer()
+        chunk = {"type": "task_update", "status": "in_progress", "title": "browser_navigate"}
+        c.emit_task_start("call_abc", "browser_navigate", task_chunk=chunk)
+        assert c._active_task_id == "call_abc"
+        assert c._active_task_title == "browser_navigate"
+        assert chunk in c._pending_task_chunks
+
+    def test_emit_task_complete_queues_chunk_and_clears(self):
+        """emit_task_complete appends chunk and clears active task state."""
+        c = _make_consumer()
+        c._active_task_id = "call_abc"
+        c._active_task_title = "browser_navigate"
+        chunk = {"type": "task_update", "status": "complete"}
+        c.emit_task_complete("call_abc", task_chunk=chunk)
+        assert chunk in c._pending_task_chunks
+        assert c._active_task_id is None
+        assert c._active_task_title is None
+
+    def test_emit_task_error_queues_chunk_and_clears(self):
+        """emit_task_error appends chunk and clears active task state."""
+        c = _make_consumer()
+        c._active_task_id = "call_abc"
+        c._active_task_title = "browser_navigate"
+        chunk = {"type": "task_update", "status": "error"}
+        c.emit_task_error("call_abc", task_chunk=chunk)
+        assert chunk in c._pending_task_chunks
+        assert c._active_task_id is None
+        assert c._active_task_title is None
+
+    def test_emit_task_start_warns_on_overlapping_task(self, caplog):
+        """emit_task_start logs WARNING if a task is already active."""
+        c = _make_consumer()
+        c._active_task_id = "call_old"
+        chunk1 = {"type": "task_update", "status": "in_progress", "title": "old_tool"}
+        chunk2 = {"type": "task_update", "status": "in_progress", "title": "new_tool"}
+        c.emit_task_start("call_old", "old_tool", task_chunk=chunk1)
+        with caplog.at_level(logging.WARNING):
+            c.emit_task_start("call_new", "new_tool", task_chunk=chunk2)
+        assert any("overlapping" in r.message.lower() or "active" in r.message.lower()
+                   for r in caplog.records)
+
+    def test_pending_chunks_empty_initially(self):
+        """No pending chunks on fresh consumer."""
+        c = _make_consumer()
+        assert c._pending_task_chunks == []
+
+    def test_active_task_none_initially(self):
+        """No active task on fresh consumer."""
+        c = _make_consumer()
+        assert c._active_task_id is None
+        assert c._active_task_title is None
+
+
+class TestTaskChunkFlushInSendOrEdit:
+    """Verify pending chunks are flushed within _send_or_edit at the
+    adapter.append_stream() call site."""
+
+    @pytest.mark.asyncio
+    async def test_native_streaming_flushes_chunks_on_append(self):
+        """When native streaming is active, pending chunks are passed to
+        append_stream alongside the text delta."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.stop_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "C123")
+
+        # Start a native stream via _send_or_edit
+        await consumer._send_or_edit("Hello")
+        assert consumer._native_streaming is True
+
+        # Queue a task chunk
+        chunk = {"type": "task_update", "status": "complete"}
+        consumer._pending_task_chunks.append(chunk)
+
+        # Trigger append_stream with pending chunks
+        await consumer._send_or_edit("Hello world")
+
+        # Verify append_stream was called with chunks kwarg
+        last_call = adapter.append_stream.call_args
+        assert last_call is not None
+        chunks_arg = last_call.kwargs.get("chunks")
+        assert chunks_arg is not None
+        assert chunk in chunks_arg
+
+    @pytest.mark.asyncio
+    async def test_native_streaming_no_chunks_passes_none(self):
+        """When no chunks pending, append_stream receives chunks=None
+        (existing markdown_text path unchanged)."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.stop_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "C123")
+
+        # Start stream
+        await consumer._send_or_edit("Hello")
+        assert consumer._native_streaming is True
+        assert consumer._pending_task_chunks == []
+
+        # Trigger append_stream without chunks
+        await consumer._send_or_edit("Hello world")
+
+        last_call = adapter.append_stream.call_args
+        chunks_arg = last_call.kwargs.get("chunks")
+        assert chunks_arg is None
+
+    @pytest.mark.asyncio
+    async def test_pending_chunks_cleared_after_flush(self):
+        """After chunks are flushed, _pending_task_chunks is empty."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.stop_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "C123")
+        await consumer._send_or_edit("Hello")
+
+        chunk = {"type": "task_update", "status": "complete"}
+        consumer._pending_task_chunks.append(chunk)
+
+        await consumer._send_or_edit("Hello world")
+        assert consumer._pending_task_chunks == []
+
+    @pytest.mark.asyncio
+    async def test_initial_stream_send_passes_pending_chunks(self):
+        """On first send via start_stream, pending chunks are passed to the
+        initial append_stream call."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "C123")
+        chunk = {"type": "task_update", "status": "in_progress", "title": "search"}
+        consumer._pending_task_chunks.append(chunk)
+
+        # First _send_or_edit should start stream and pass chunks to append
+        await consumer._send_or_edit("Starting text")
+
+        # The append_stream call after start should receive the chunks
+        last_append_call = adapter.append_stream.call_args
+        chunks_arg = last_append_call.kwargs.get("chunks")
+        assert chunks_arg is not None
+        assert chunk in chunks_arg
+
+
+class TestTaskChunkFlushOnGotDone:
+    """Remaining chunks flushed on got_done before stop_stream."""
+
+    @pytest.mark.asyncio
+    async def test_remaining_chunks_flushed_before_stop_stream(self):
+        """If pending chunks exist when got_done arrives in native streaming,
+        they are flushed via append_stream before stop_stream."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.stop_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "C123", config)
+
+        # Feed some text to start native streaming
+        consumer.on_delta("Hello")
+        # Queue a task chunk that should be flushed on got_done
+        chunk = {"type": "task_update", "status": "complete"}
+        consumer._pending_task_chunks.append(chunk)
+        consumer.finish()
+
+        await consumer.run()
+
+        # stop_stream should have been called
+        adapter.stop_stream.assert_called_once()
+        # append_stream should have been called at some point with chunks
+        found_chunks_call = False
+        for call in adapter.append_stream.call_args_list:
+            if call.kwargs.get("chunks") is not None:
+                found_chunks_call = True
+                break
+        assert found_chunks_call, "Expected append_stream call with chunks before stop_stream"
+
+
+class TestTaskChunkResetOnSegmentState:
+    """Verify _pending_task_chunks is reset in _reset_segment_state, and
+    active task state persists across segments."""
+
+    def test_reset_segment_state_clears_pending_chunks(self):
+        """_reset_segment_state clears _pending_task_chunks."""
+        c = _make_consumer()
+        c._pending_task_chunks = [{"type": "task_update"}]
+        c._reset_segment_state()
+        assert c._pending_task_chunks == []
+
+    def test_reset_segment_state_preserves_active_task(self):
+        """Active task state persists across segment resets (tool calls span segments)."""
+        c = _make_consumer()
+        c._active_task_id = "call_abc"
+        c._active_task_title = "browser_navigate"
+        c._reset_segment_state()
+        assert c._active_task_id == "call_abc"
+        assert c._active_task_title == "browser_navigate"
