@@ -85,6 +85,7 @@ from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    THREAD_MEM_GUIDANCE,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -1684,6 +1685,17 @@ class AIAgent:
                 if _tname:
                     self.valid_tool_names.add(_tname)
                     _existing_tool_names.add(_tname)
+
+        # Thread/user memory manager — wraps SessionDB CRUD for
+        # thread_mem.* and user_mem.* tool calls.  Available when
+        # _session_db is present (gateway and CLI sessions).
+        self._thread_user_memory_manager = None
+        if self._session_db:
+            try:
+                from agent.thread_user_memory import ThreadUserMemoryManager
+                self._thread_user_memory_manager = ThreadUserMemoryManager(self._session_db)
+            except Exception:
+                pass  # Thread/user memory is optional — don't break agent init
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
@@ -4408,6 +4420,8 @@ class AIAgent:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
+        if "thread_mem.set" in self.valid_tool_names:
+            tool_guidance.append(THREAD_MEM_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
 
@@ -8398,6 +8412,10 @@ class AIAgent:
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
+        elif self._thread_user_memory_manager and function_name.startswith(("thread_mem.", "user_mem.")):
+            function_args.setdefault("_gateway_session_key", self._gateway_session_key or "")
+            function_args.setdefault("_user_id", self._user_id or "")
+            return self._thread_user_memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
@@ -8991,6 +9009,31 @@ class AIAgent:
                 finally:
                     tool_duration = time.time() - tool_start_time
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    elif self._should_emit_quiet_tool_messages():
+                        self._vprint(f"  {cute_msg}")
+            elif self._thread_user_memory_manager and function_name.startswith(("thread_mem.", "user_mem.")):
+                # Thread/user memory tools — route through ThreadUserMemoryManager.
+                function_args.setdefault("_gateway_session_key", self._gateway_session_key or "")
+                function_args.setdefault("_user_id", self._user_id or "")
+                spinner = None
+                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    emoji = _get_tool_emoji(function_name)
+                    preview = _build_tool_preview(function_name, function_args) or function_name
+                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
+                    spinner.start()
+                _tum_result = None
+                try:
+                    function_result = self._thread_user_memory_manager.handle_tool_call(function_name, function_args)
+                    _tum_result = function_result
+                except Exception as tool_error:
+                    function_result = json.dumps({"error": f"Thread/user memory tool '{function_name}' failed: {tool_error}"})
+                    logger.error("thread_user_memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                finally:
+                    tool_duration = time.time() - tool_start_time
+                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_tum_result)
                     if spinner:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
@@ -9666,6 +9709,18 @@ class AIAgent:
             except Exception:
                 pass
 
+        # Thread/user memory prefetch — query both tables and format
+        # <thread-context>/<user-context> blocks for prompt injection.
+        _thread_user_memory_context = ""
+        if self._thread_user_memory_manager:
+            try:
+                _thread_user_memory_context = self._thread_user_memory_manager.prefetch(
+                    session_key=self._gateway_session_key or "",
+                    user_id=self._user_id or "",
+                )
+            except Exception:
+                pass
+
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
@@ -9810,6 +9865,8 @@ class AIAgent:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
                             _injections.append(_fenced)
+                    if _thread_user_memory_context:
+                        _injections.append(_thread_user_memory_context)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
                     if _injections:

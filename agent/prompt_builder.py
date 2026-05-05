@@ -176,6 +176,30 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+THREAD_MEM_GUIDANCE = (
+    "You have two memory tools for context management:\n"
+    "\n"
+    "1. **thread_mem** — Thread-scoped working memory. Use `thread_mem.set(key, value)` "
+    "to remember facts established in THIS conversation thread. This memory is ephemeral "
+    "and cleared when the session resets. Use it for:\n"
+    "   - Intermediate conclusions during this conversation\n"
+    "   - References established earlier in this thread (file paths, variable names, decisions)\n"
+    "   - Working state that only matters within this conversation\n"
+    "\n"
+    "2. **user_mem** — User-level cross-channel memory. Use `user_mem.set(key, value, ttl_hours?)` "
+    "to remember facts about the USER that persist across channels and sessions. Use it for:\n"
+    "   - User preferences (language, framework, communication style)\n"
+    "   - Permanent facts (name, team, project name) — omit ttl_hours or set to 0\n"
+    "   - Ephemeral facts (currently debugging X, focused on Y) — set ttl_hours "
+    "(e.g., 8 for workday, 24 for daily)\n"
+    "\n"
+    "Prefer specific keys over vague ones: `project_name` not `info`, `current_task` not `status`.\n"
+    "\n"
+    "Do NOT use memory tools for information already in the conversation history — "
+    "that wastes tokens. Use them for facts you'll need LATER in the conversation "
+    "but might lose if context is compressed."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
