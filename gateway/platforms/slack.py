@@ -521,6 +521,13 @@ class SlackAdapter(BasePlatformAdapter):
         Falls back to ``message_id`` when ``thread_id``/``thread_ts`` is
         absent so the indicator also works in DMs and channels that don't
         have a thread parent.
+
+        NOTE: assistant_threads_setStatus only renders a visible indicator in
+        Slack assistant thread contexts. Outside assistant threads, the API
+        call succeeds but no typing/thinking indicator is shown to the user.
+        This is a Slack platform limitation. No fallback (emoji reactions, etc.)
+        is provided — the user explicitly rejected those alternatives.
+        See docs/diary/decisions/2026-05-01-slack-typing-streaming-presence.md
         """
         if not self._app and not self._primary_client:
             return
@@ -1436,7 +1443,15 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
     async def _handle_assistant_thread_lifecycle_event(self, event: dict) -> None:
-        """Handle Slack Assistant lifecycle events that carry user/thread identity."""
+        """Handle Slack Assistant lifecycle events that carry user/thread identity.
+
+        NOTE: Slack assistant thread lifecycle events (assistant_thread_started,
+        assistant_thread_context_changed) only fire in Socket Mode. In NIXI_MODE
+        (HTTP-based Events API), these events are not delivered. The message_id
+        fallback in build_source() (passed via metadata) provides the thread_ts
+        needed for setStatus and streaming even without lifecycle events.
+        See docs/diary/decisions/2026-05-01-slack-typing-streaming-presence.md
+        """
         metadata = self._extract_assistant_thread_metadata(event)
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
