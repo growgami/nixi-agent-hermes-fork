@@ -361,7 +361,7 @@ class TestConsumerStreamingDispatch:
         assert consumer._last_streamed_len == len("Hello world")
         adapter.start_stream.assert_called_once()
         adapter.append_stream.assert_called_once_with(
-            "C_CHAN", "Hello world", metadata=metadata,
+            "C_CHAN", "Hello world", metadata=metadata, chunks=None,
         )
         # Should NOT call send or edit
         adapter.send.assert_not_called()
@@ -385,7 +385,7 @@ class TestConsumerStreamingDispatch:
         assert result is True
         # Delta should be " world"
         adapter.append_stream.assert_called_once_with(
-            "C_CHAN", " world", metadata=metadata,
+            "C_CHAN", " world", metadata=metadata, chunks=None,
         )
         assert consumer._last_streamed_len == len("Hello world")
 

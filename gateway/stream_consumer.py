@@ -45,6 +45,7 @@ class StreamConsumerConfig:
     buffer_threshold: int = 40
     cursor: str = " ▉"
     buffer_only: bool = False
+    task_display_mode: str = "timeline"  # "timeline" or "plan"
 
 
 class GatewayStreamConsumer:
@@ -898,6 +899,7 @@ class GatewayStreamConsumer:
             # First send — attempt to start a native stream
             message_ts = await self.adapter.start_stream(
                 self.chat_id, metadata=self.metadata,
+                task_display_mode=self.cfg.task_display_mode,
             )
             if message_ts:
                 # Streaming started successfully (S-2)

@@ -1555,3 +1555,74 @@ class TestTaskChunkResetOnSegmentState:
         c._reset_segment_state()
         assert c._active_task_id == "call_abc"
         assert c._active_task_title == "browser_navigate"
+
+
+# ── task_display_mode config passthrough tests (Task 8) ──────────────────
+
+
+class TestTaskDisplayModeConfig:
+    """Verify StreamConsumerConfig has task_display_mode and it reaches start_stream."""
+
+    def test_default_task_display_mode_is_timeline(self):
+        """StreamConsumerConfig defaults task_display_mode to 'timeline'."""
+        cfg = StreamConsumerConfig()
+        assert cfg.task_display_mode == "timeline"
+
+    def test_task_display_mode_can_be_overridden(self):
+        """StreamConsumerConfig allows overriding task_display_mode."""
+        cfg = StreamConsumerConfig(task_display_mode="plan")
+        assert cfg.task_display_mode == "plan"
+
+    @pytest.mark.asyncio
+    async def test_start_stream_receives_task_display_mode_from_config(self):
+        """start_stream() receives task_display_mode from StreamConsumerConfig."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.stop_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        cfg = StreamConsumerConfig(task_display_mode="timeline")
+        consumer = GatewayStreamConsumer(adapter, "C123", config=cfg)
+
+        # Trigger _send_or_edit to call start_stream
+        await consumer._send_or_edit("Hello")
+
+        # Verify start_stream was called with task_display_mode from config
+        adapter.start_stream.assert_called_once()
+        call_kwargs = adapter.start_stream.call_args.kwargs
+        assert call_kwargs["task_display_mode"] == "timeline"
+
+    @pytest.mark.asyncio
+    async def test_start_stream_receives_plan_mode_from_config(self):
+        """start_stream() receives task_display_mode='plan' when configured."""
+        adapter = MagicMock()
+        adapter.start_stream = AsyncMock(return_value="1234.5678")
+        adapter.append_stream = AsyncMock(return_value=True)
+        adapter.stop_stream = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        cfg = StreamConsumerConfig(task_display_mode="plan")
+        consumer = GatewayStreamConsumer(adapter, "C123", config=cfg)
+
+        await consumer._send_or_edit("Hello")
+
+        adapter.start_stream.assert_called_once()
+        call_kwargs = adapter.start_stream.call_args.kwargs
+        assert call_kwargs["task_display_mode"] == "plan"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_adapter_unaffected_by_task_display_mode(self):
+        """Non-Slack adapters (no start_stream method) are unaffected by task_display_mode."""
+        adapter = MagicMock(spec=[])  # No start_stream attribute
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        cfg = StreamConsumerConfig(task_display_mode="timeline")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config=cfg)
+
+        # Should not crash — falls through to regular send path
+        result = await consumer._send_or_edit("Hello")
+        assert result is True
+        adapter.send.assert_called_once()
