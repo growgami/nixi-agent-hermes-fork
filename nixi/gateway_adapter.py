@@ -517,6 +517,45 @@ class NixiAdapter(BasePlatformAdapter):
         task.add_done_callback(self._background_tasks.discard)
 
     # ------------------------------------------------------------------
+    # Outbound mention cache registration
+    # ------------------------------------------------------------------
+
+    def _record_outbound_thread_presence(
+        self,
+        result: SendResult,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record outbound send in the mention cache.
+
+        When the bot sends a message to a thread, record that thread's ts
+        so subsequent user replies are recognized as thread continuations.
+        For top-level channel messages, record the message_id so that
+        threads created off the bot's message are also recognized.
+
+        Precedence: metadata thread_id > metadata thread_ts > reply_to > message_id.
+        No-op for DM sends where thread tracking is unnecessary.
+        """
+        if not result.success:
+            return
+
+        meta = metadata or {}
+
+        # Thread context from gateway (thread the bot is replying in)
+        thread_ts = meta.get("thread_id") or meta.get("thread_ts")
+        if not thread_ts:
+            # Fall back to reply_to (direct reply to a parent message)
+            thread_ts = reply_to
+
+        if thread_ts:
+            self._mention_cache.record(thread_ts)
+            return
+
+        # Top-level channel message — record ts so threads off it are recognized
+        if result.message_id:
+            self._mention_cache.record(result.message_id)
+
+    # ------------------------------------------------------------------
     # Outbound delivery (delegates to Slack adapter)
     # ------------------------------------------------------------------
 
@@ -537,9 +576,11 @@ class NixiAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error="Slack adapter not available for delivery"
             )
-        return await slack_adapter.send(
+        result = await slack_adapter.send(
             chat_id, content, reply_to=reply_to, metadata=metadata
         )
+        self._record_outbound_thread_presence(result, reply_to, metadata)
+        return result
 
     async def send_image(
         self,
@@ -559,9 +600,11 @@ class NixiAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error="Slack adapter not available for delivery"
             )
-        return await slack_adapter.send_image(
+        result = await slack_adapter.send_image(
             chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata
         )
+        self._record_outbound_thread_presence(result, reply_to, metadata)
+        return result
 
     async def send_document(
         self,
@@ -582,7 +625,7 @@ class NixiAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error="Slack adapter not available for delivery"
             )
-        return await slack_adapter.send_document(
+        result = await slack_adapter.send_document(
             chat_id,
             file_path,
             caption=caption,
@@ -590,6 +633,8 @@ class NixiAdapter(BasePlatformAdapter):
             reply_to=reply_to,
             **kwargs,
         )
+        self._record_outbound_thread_presence(result, reply_to, kwargs.get("metadata"))
+        return result
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """No-op — Nixi has no typing indicator API."""

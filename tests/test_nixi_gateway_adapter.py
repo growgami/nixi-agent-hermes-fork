@@ -1528,3 +1528,131 @@ class TestIntentClassifierIntegration:
         # DROP: no name match, no slack mention, unrelated_drop_rule fires
         await asyncio.sleep(0.05)
         assert len(called_events) == 0
+
+
+# ─── Outbound mention cache registration ───────────────────────────────────
+
+
+class TestOutboundMentionCacheRegistration:
+    """Tests for _record_outbound_thread_presence — registering outbound
+    sends in _mention_cache so thread continuations are recognized."""
+
+    def _make_adapter_with_mock_runner(self):
+        from nixi.gateway_adapter import NixiAdapter
+
+        config = PlatformConfig(enabled=True, extra={"internal_secret": "test", "team_id": "T1"})
+        adapter = NixiAdapter(config)
+
+        mock_slack = AsyncMock()
+        mock_slack.send = AsyncMock(return_value=SendResult(success=True, message_id="1234.5678"))
+        mock_slack.send_image = AsyncMock(return_value=SendResult(success=True, message_id="1234.5678"))
+        mock_slack.send_document = AsyncMock(return_value=SendResult(success=True, message_id="1234.5678"))
+
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform.SLACK: mock_slack}
+
+        adapter.gateway_runner = mock_runner
+        return adapter, mock_slack
+
+    @pytest.mark.asyncio
+    async def test_send_with_thread_id_metadata_records_in_cache(self):
+        """send() with metadata={"thread_id": "1234.5678"} records thread_ts in cache."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+        thread_ts = "1234.5678"
+
+        result = await adapter.send(
+            "C123", "Hello", metadata={"thread_id": thread_ts}
+        )
+
+        assert result.success is True
+        assert adapter._mention_cache.had_bot(thread_ts) is True
+
+    @pytest.mark.asyncio
+    async def test_send_with_thread_ts_metadata_records_in_cache(self):
+        """send() with metadata={"thread_ts": "9999.0000"} records thread_ts in cache."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+        thread_ts = "9999.0000"
+
+        result = await adapter.send(
+            "C123", "Hello", metadata={"thread_ts": thread_ts}
+        )
+
+        assert result.success is True
+        assert adapter._mention_cache.had_bot(thread_ts) is True
+
+    @pytest.mark.asyncio
+    async def test_send_no_thread_metadata_records_message_id(self):
+        """send() with no thread metadata but successful SendResult records message_id in cache."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+
+        result = await adapter.send("C123", "Hello")
+
+        assert result.success is True
+        # message_id="1234.5678" from mock should be recorded
+        assert adapter._mention_cache.had_bot("1234.5678") is True
+
+    @pytest.mark.asyncio
+    async def test_send_failed_result_does_not_record(self):
+        """send() with failed SendResult does not record anything in cache."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+        mock_slack.send = AsyncMock(return_value=SendResult(success=False, error="fail"))
+
+        result = await adapter.send("C123", "Hello")
+
+        assert result.success is False
+        # No thread_ts or message_id recorded
+        assert adapter._mention_cache.had_bot("1234.5678") is False
+
+    @pytest.mark.asyncio
+    async def test_send_reply_to_fallback_records_in_cache(self):
+        """send() with reply_to="1234.5678" and no metadata records reply_to in cache."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+        # Return SendResult without message_id to isolate reply_to path
+        mock_slack.send = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send(
+            "C123", "Hello", reply_to="1234.5678"
+        )
+
+        assert result.success is True
+        assert adapter._mention_cache.had_bot("1234.5678") is True
+
+    @pytest.mark.asyncio
+    async def test_send_metadata_thread_id_takes_precedence_over_reply_to(self):
+        """metadata["thread_id"] takes precedence over reply_to when both are present."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+
+        result = await adapter.send(
+            "C123", "Hello", reply_to="1111.0000", metadata={"thread_id": "2222.0000"}
+        )
+
+        assert result.success is True
+        assert adapter._mention_cache.had_bot("2222.0000") is True
+        # reply_to "1111.0000" should NOT be recorded since thread_id takes precedence
+        assert adapter._mention_cache.had_bot("1111.0000") is False
+
+    @pytest.mark.asyncio
+    async def test_send_image_registers_thread_presence(self):
+        """send_image() also registers thread presence from metadata."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+        thread_ts = "5555.6666"
+
+        result = await adapter.send_image(
+            "C123", "https://img.png", metadata={"thread_id": thread_ts}
+        )
+
+        assert result.success is True
+        assert adapter._mention_cache.had_bot(thread_ts) is True
+
+    @pytest.mark.asyncio
+    async def test_send_document_registers_thread_presence(self):
+        """send_document() also registers thread presence from metadata."""
+        adapter, mock_slack = self._make_adapter_with_mock_runner()
+        thread_ts = "7777.8888"
+
+        result = await adapter.send_document(
+            "C123", "/file.pdf", metadata={"thread_id": thread_ts}
+        )
+
+        assert result.success is True
+        assert adapter._mention_cache.had_bot(thread_ts) is True
