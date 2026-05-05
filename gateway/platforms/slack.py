@@ -527,7 +527,7 @@ class SlackAdapter(BasePlatformAdapter):
         if metadata is None:
             metadata = {}
 
-        # Permamently disabled — auth fundamentally broken (requires reinstall).
+        # Permanently disabled — auth fundamentally broken (requires reinstall).
         if self._setStatus_disabled:
             return
 
