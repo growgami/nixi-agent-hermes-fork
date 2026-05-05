@@ -79,6 +79,7 @@ class SlackAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+    _SETSTATUS_TTL = 1800.0    # 30 minutes — TTL for transient scope errors
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
@@ -125,10 +126,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Rate-limited logging for assistant_threads_setStatus failures.
         # _setStatus_warned: chat_ids that have already had a WARNING logged.
         self._setStatus_warned: set = set()
-        # _setStatus_no_scope: chat_ids that permanently lack the
-        # assistant:write scope (missing_scope/invalid_auth/not_authed).
-        # Once added, further calls are silently suppressed.
-        self._setStatus_no_scope: set = set()
+        # _setStatus_disabled: permanently True when a permanent scope/auth error
+        # (missing_scope, invalid_auth, not_authed) occurs — app reinstall required.
+        self._setStatus_disabled: bool = False
+        # _setStatus_no_scope: maps chat_id → time.monotonic() timestamp of
+        # transient scope error suppression.  Entries expire after _SETSTATUS_TTL
+        # seconds; on expiry, the next send_typing() / stop_typing() call retries.
+        self._setStatus_no_scope: Dict[str, float] = {}
         # Streaming state: maps chat_id → message ts from chat.startStream.
         # Used for chat_appendStream / chat_stopStream calls AND for fallback
         # edit targeting when streaming fails mid-stream.
@@ -523,9 +527,18 @@ class SlackAdapter(BasePlatformAdapter):
         if metadata is None:
             metadata = {}
 
-        # Permanently suppressed — this chat_id lacks the required scope.
-        if chat_id in self._setStatus_no_scope:
+        # Permamently disabled — auth fundamentally broken (requires reinstall).
+        if self._setStatus_disabled:
             return
+
+        # Transient scope-error suppression with TTL.
+        if chat_id in self._setStatus_no_scope:
+            elapsed = time.monotonic() - self._setStatus_no_scope[chat_id]
+            if elapsed < self._SETSTATUS_TTL:
+                return  # Still within TTL — suppress
+            # TTL expired — remove and retry
+            del self._setStatus_no_scope[chat_id]
+            logger.debug("[Slack] _setStatus_no_scope TTL expired for %s — retrying", chat_id)
 
         # Resolve thread_ts: prefer thread_id/thread_ts, fall back to message_id.
         thread_ts = (
@@ -546,22 +559,39 @@ class SlackAdapter(BasePlatformAdapter):
             )
             # Success — remove from warned set so future failures re-log.
             self._setStatus_warned.discard(chat_id)
+            self._setStatus_no_scope.pop(chat_id, None)  # Clear scope suppression if scope was fixed
         except Exception as e:
             error_str = str(e)
-            # Permanently suppress auth/scope errors after first INFO log.
-            is_scope_error = any(
+            # Permanent vs transient scope errors.
+            error_code = None
+            for marker in ("missing_scope", "invalid_auth", "not_authed"):
+                if marker in error_str:
+                    error_code = marker
+                    break
+
+            if error_code:
+                # Permanent scope error — app auth fundamentally broken.
+                self._setStatus_disabled = True
+                logger.error(
+                    "[Slack] Permanent scope error (%s) in setStatus for %s — "
+                    "app reinstall required: %s",
+                    error_code, chat_id, e,
+                )
+                return
+
+            # Transient scope error (or other error that looks scope-like).
+            # Check for less common scope error patterns.
+            is_transient_scope = any(
                 marker in error_str
-                for marker in ("missing_scope", "invalid_auth", "not_authed")
+                for marker in ("scope", "permission", "forbidden", "unauthorized")
             )
-            if is_scope_error:
-                if chat_id not in self._setStatus_no_scope:
-                    self._setStatus_no_scope.add(chat_id)
-                    logger.info(
-                        "[Slack] assistant.threads.setStatus missing scope for %s — "
-                        "suppressing further attempts: %s",
-                        chat_id,
-                        e,
-                    )
+            if is_transient_scope and chat_id not in self._setStatus_no_scope:
+                self._setStatus_no_scope[chat_id] = time.monotonic()
+                logger.info(
+                    "[Slack] Transient scope error in setStatus for %s — "
+                    "suppressing for %ds: %s",
+                    chat_id, int(self._SETSTATUS_TTL), e,
+                )
                 return
 
             # Rate-limited logging: WARNING once per chat_id, then DEBUG.
@@ -587,6 +617,17 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not self._app and not self._primary_client:
             return
+        # Permanently disabled — auth fundamentally broken (requires reinstall).
+        if self._setStatus_disabled:
+            return
+        # Transient scope-error suppression with TTL.
+        if chat_id in self._setStatus_no_scope:
+            elapsed = time.monotonic() - self._setStatus_no_scope[chat_id]
+            if elapsed < self._SETSTATUS_TTL:
+                return  # Still within TTL — suppress
+            del self._setStatus_no_scope[chat_id]
+            logger.debug("[Slack] _setStatus_no_scope TTL expired for %s — retrying", chat_id)
+
         # Stop active stream if one exists (cleanup for setStatus auto-clear)
         if chat_id in self._active_stream_ts:
             await self.stop_stream(chat_id)
@@ -599,22 +640,38 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts=thread_ts,
                 status="",
             )
-            # Success — clear warned state for this chat_id.
+            # Success — clear warned state and scope suppression for this chat_id.
             self._setStatus_warned.discard(chat_id)
+            self._setStatus_no_scope.pop(chat_id, None)
         except Exception as e:
             error_str = str(e)
-            is_scope_error = any(
+            # Permanent vs transient scope errors.
+            error_code = None
+            for marker in ("missing_scope", "invalid_auth", "not_authed"):
+                if marker in error_str:
+                    error_code = marker
+                    break
+
+            if error_code:
+                self._setStatus_disabled = True
+                logger.error(
+                    "[Slack] Permanent scope error (%s) in setStatus clear for %s — "
+                    "app reinstall required: %s",
+                    error_code, chat_id, e,
+                )
+                return
+
+            is_transient_scope = any(
                 marker in error_str
-                for marker in ("missing_scope", "invalid_auth", "not_authed")
+                for marker in ("scope", "permission", "forbidden", "unauthorized")
             )
-            if is_scope_error:
-                if chat_id not in self._setStatus_no_scope:
-                    self._setStatus_no_scope.add(chat_id)
-                    logger.info(
-                        "[Slack] assistant.threads.setStatus clear missing scope for %s: %s",
-                        chat_id,
-                        e,
-                    )
+            if is_transient_scope and chat_id not in self._setStatus_no_scope:
+                self._setStatus_no_scope[chat_id] = time.monotonic()
+                logger.info(
+                    "[Slack] Transient scope error in setStatus clear for %s — "
+                    "suppressing for %ds: %s",
+                    chat_id, int(self._SETSTATUS_TTL), e,
+                )
                 return
 
             if chat_id not in self._setStatus_warned:

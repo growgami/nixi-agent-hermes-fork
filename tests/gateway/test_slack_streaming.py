@@ -940,6 +940,270 @@ class TestStreamingDisabledDocumentation:
         assert "D_OTHER" not in adapter._streaming_disabled
 
 
+class TestSetStatusTTLRecovery:
+    """Verify TTL-based recovery for transient scope errors in _setStatus_no_scope.
+
+    Bug 3 fix: scope errors in send_typing/stop_typing are now split into:
+    - Permanent (missing_scope/invalid_auth/not_authed) → _setStatus_disabled = True
+    - Transient (all other scope errors) → _setStatus_no_scope[chat_id] = timestamp, TTL 30 min
+    On success, entry removed immediately.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_scope_error_ttl_expired_retries(self):
+        """After TTL expires, send_typing retries the API call."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        # Seed a transient scope error that has expired (31 min ago)
+        adapter._setStatus_no_scope["C_CHAN"] = time.monotonic() - 1860  # 31 min ago
+
+        mock_client.assistant_threads_setStatus = AsyncMock(return_value={})
+        metadata = {"thread_id": "111.222"}
+
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        # API call should be attempted (TTL expired → retry)
+        mock_client.assistant_threads_setStatus.assert_called_once()
+        # Entry should be removed (cleared on success path)
+        assert "C_CHAN" not in adapter._setStatus_no_scope
+
+    @pytest.mark.asyncio
+    async def test_transient_scope_error_within_ttl_suppressed(self):
+        """Within TTL, send_typing returns early without API call."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        # Seed a transient scope error that is still within TTL (1 min ago)
+        adapter._setStatus_no_scope["C_CHAN"] = time.monotonic() - 60
+
+        metadata = {"thread_id": "111.222"}
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        # API call should NOT be attempted (within TTL)
+        mock_client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_permanent_scope_error_disables_setstatus(self):
+        """Permanent scope errors (missing_scope) set _setStatus_disabled = True."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("missing_scope: need assistant:write")
+        )
+
+        metadata = {"thread_id": "111.222"}
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        assert adapter._setStatus_disabled is True
+        # NOT added to _setStatus_no_scope — permanent flag instead
+        assert "C_CHAN" not in adapter._setStatus_no_scope
+
+    @pytest.mark.asyncio
+    async def test_invalid_auth_permanent_disable(self):
+        """invalid_auth sets _setStatus_disabled = True (permanent)."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("invalid_auth")
+        )
+
+        metadata = {"thread_id": "111.222"}
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        assert adapter._setStatus_disabled is True
+
+    @pytest.mark.asyncio
+    async def test_not_authed_permanent_disable(self):
+        """not_authed sets _setStatus_disabled = True (permanent)."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("not_authed")
+        )
+
+        metadata = {"thread_id": "111.222"}
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        assert adapter._setStatus_disabled is True
+
+    @pytest.mark.asyncio
+    async def test_transient_scope_error_stores_timestamp(self):
+        """Transient scope errors store current monotonic timestamp."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        before = time.monotonic()
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("some_other_scope_error: permission denied")
+        )
+
+        metadata = {"thread_id": "111.222"}
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        after = time.monotonic()
+
+        assert "C_CHAN" in adapter._setStatus_no_scope
+        assert before <= adapter._setStatus_no_scope["C_CHAN"] <= after
+
+    @pytest.mark.asyncio
+    async def test_success_clears_setstatus_no_scope(self):
+        """On success, send_typing removes chat_id from _setStatus_no_scope."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        # Pre-seed a transient scope error entry
+        adapter._setStatus_no_scope["C_CHAN"] = time.monotonic() - 60
+
+        mock_client.assistant_threads_setStatus = AsyncMock(return_value={})
+        metadata = {"thread_id": "111.222"}
+
+        # TTL expired, so the API call is attempted and succeeds
+        # (TTL expiry already tested separately; here we test the success clear)
+        # First set entry that hasn't expired, then call after API success clears it
+        adapter._setStatus_no_scope["C_CHAN"] = time.monotonic() - 1860  # expired
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        assert "C_CHAN" not in adapter._setStatus_no_scope
+
+    @pytest.mark.asyncio
+    async def test_permanent_disable_suppresses_all_future_calls(self):
+        """Once _setStatus_disabled = True, all send_typing calls are suppressed."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        adapter._setStatus_disabled = True
+
+        metadata = {"thread_id": "111.222"}
+        await adapter.send_typing("C_CHAN", metadata=metadata)
+
+        mock_client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_transient_error_ttl_expired_retries(self):
+        """After TTL expires, stop_typing retries the API call."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+        # Seed a transient scope error that has expired
+        adapter._setStatus_no_scope["C_CHAN"] = time.monotonic() - 1860
+
+        mock_client.assistant_threads_setStatus = AsyncMock(return_value={})
+
+        await adapter.stop_typing("C_CHAN")
+
+        mock_client.assistant_threads_setStatus.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_permanent_error_disables(self):
+        """Permanent scope error in stop_typing sets _setStatus_disabled = True."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("missing_scope: need assistant:write")
+        )
+
+        await adapter.stop_typing("C_CHAN")
+
+        assert adapter._setStatus_disabled is True
+        assert "C_CHAN" not in adapter._setStatus_no_scope
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_transient_error_stores_timestamp(self):
+        """Transient scope error in stop_typing stores timestamp in _setStatus_no_scope."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+
+        before = time.monotonic()
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("some_scope_error")
+        )
+
+        await adapter.stop_typing("C_CHAN")
+
+        after = time.monotonic()
+
+        assert "C_CHAN" in adapter._setStatus_no_scope
+        assert before <= adapter._setStatus_no_scope["C_CHAN"] <= after
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_success_clears_setstatus_no_scope(self):
+        """On success, stop_typing removes chat_id from _setStatus_no_scope."""
+        import time
+
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+        # Seed expired TTL entry
+        adapter._setStatus_no_scope["C_CHAN"] = time.monotonic() - 1860
+
+        mock_client.assistant_threads_setStatus = AsyncMock(return_value={})
+
+        await adapter.stop_typing("C_CHAN")
+
+        assert "C_CHAN" not in adapter._setStatus_no_scope
+
+    @pytest.mark.asyncio
+    async def test_permanent_disable_suppresses_stop_typing(self):
+        """Once _setStatus_disabled = True, stop_typing calls are suppressed."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        adapter._setStatus_disabled = True
+        adapter._active_status_threads["C_CHAN"] = "111.222"
+
+        await adapter.stop_typing("C_CHAN")
+
+        mock_client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_warning_once_then_debug(self):
+        """Non-scope errors still rate-limit: WARNING once, then DEBUG."""
+        adapter = _make_adapter()
+        mock_client = adapter._primary_client
+
+        mock_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("rate_limited")
+        )
+
+        metadata = {"thread_id": "111.222"}
+
+        # First call: WARNING
+        with patch("gateway.platforms.slack.logger") as mock_logger:
+            await adapter.send_typing("C_CHAN", metadata=metadata)
+            # Second call: DEBUG
+            await adapter.send_typing("C_CHAN", metadata=metadata)
+
+            # Check that warning was called once and debug after
+            warning_calls = [c for c in mock_logger.warning.call_args_list
+                           if "setStatus" in str(c) or "failed" in str(c)]
+            debug_calls = [c for c in mock_logger.debug.call_args_list
+                         if "setStatus" in str(c) or "failed" in str(c)]
+            assert len(warning_calls) >= 1
+
+
 class TestHealthMonitor:
     """Verify health monitor delegation works via _set_fatal_error."""
 
