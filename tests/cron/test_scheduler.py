@@ -1825,3 +1825,29 @@ class TestNixiSlackDelivery:
         assert send_mock.call_count == 1
         sent_platform = send_mock.call_args[0][0]
         assert sent_platform == Platform.SLACK, f"Expected Platform.SLACK but got {sent_platform}"
+
+    def test_scheduler_nixi_platform_map_maps_to_slack(self):
+        """Verify that 'nixi' in the scheduler's platform_map resolves to Platform.SLACK.
+
+        The platform_map is a local dict inside _deliver_result, so we test
+        the behavior: a deliver='nixi:C...' job should cause _send_to_platform
+        to be called with Platform.SLACK, confirming the mapping.
+        """
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "nixi-map-test",
+                "deliver": "nixi:C98765432",
+            }
+            _deliver_result(job, "Test nixi mapping")
+
+        send_mock.assert_awaited_once()
+        assert send_mock.call_args[0][0] is Platform.SLACK
