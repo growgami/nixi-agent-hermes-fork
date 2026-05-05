@@ -251,6 +251,21 @@ def count_by_channel(conn: sqlite3.Connection) -> dict[str, int]:
     return {row["channel_id"]: row["cnt"] for row in cursor.fetchall()}
 
 
+def ensure_analyst_schema(db_path: Path | None = None) -> None:
+    """Delegate to nixi.analyst.schema.ensure_analyst_schema.
+
+    Creates/ensures analyst tables in analyst_state.db (separate from
+    nixi_state.db). See nixi.analyst.schema for full documentation.
+
+    Args:
+        db_path: Path to analyst_state.db. Defaults to
+            get_hermes_home() / "analyst_state.db".
+    """
+    from nixi.analyst.schema import ensure_analyst_schema as _ensure_analyst_schema
+
+    _ensure_analyst_schema(db_path)
+
+
 def build_user_map(conn: sqlite3.Connection, cooccurrence_threshold: int = 3) -> UserMap:
     """Build a UserMap correlating display names with Slack user IDs.
 
