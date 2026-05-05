@@ -48,6 +48,9 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Thread-scoped and user-scoped memory
+    "thread_mem.set", "thread_mem.get", "thread_mem.delete",
+    "user_mem.set", "user_mem.get", "user_mem.delete",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -166,6 +169,18 @@ TOOLSETS = {
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
+        "includes": []
+    },
+
+    "thread_mem": {
+        "description": "Thread-scoped working memory — ephemeral key-value store tied to the current conversation thread",
+        "tools": ["thread_mem.set", "thread_mem.get", "thread_mem.delete"],
+        "includes": []
+    },
+
+    "user_mem": {
+        "description": "User-level persistent memory — key-value store that persists across channels and sessions for identified users",
+        "tools": ["user_mem.set", "user_mem.get", "user_mem.delete"],
         "includes": []
     },
     
